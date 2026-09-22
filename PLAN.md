@@ -205,6 +205,73 @@ The sharer uploads one copy per viewer. At 10 Mbps × 4 viewers = 40 Mbps up, a 
 
 ---
 
+## 5a. Camera video
+
+The camera is a third kind of media next to mic audio and screen share. Each user can send a camera and a screen share at the same time.
+
+### 5a.1 Behaviour
+- **Off by default** on every join. A camera button in the voice bar turns it on or off. The OS camera light is the source of truth: turning the camera off **stops the capture track** so the light goes off. It doesn't just stop sending.
+- **Sent automatically** to everyone in the channel, unlike screen share, which needs Watch. Each viewer can still pause any camera or all cameras.
+- **Self-preview** is mirrored, like a mirror. Friends see it unmirrored.
+- **Tiles:** a participant with the camera on shows video instead of the avatar. The speaking ring stays around the video. Muted and deafened icons are overlaid on it.
+- **Stage view** (someone's screen share is focused): cameras move to a small strip below the stream at a lower quality (§5a.3).
+
+### 5a.2 Media pipeline
+- Capture with `getUserMedia({video: {deviceId, width: {ideal: 1280}, height: {ideal: 720}, frameRate: {ideal: 30}}})` and `contentHint = 'motion'`.
+- The engine sends the camera on its **own transceiver and stream id**, separate from mic and screen, so the receiver can tell mic, camera and screen apart. It uses the same scheme as screen share.
+- **The first time the camera is enabled**, `addTrack` runs, followed by one renegotiation.
+- **Later off/on toggles** use `sender.replaceTrack(null | track)`, which needs no renegotiation. The receiver sees the track muted or unmuted, and `VoiceState.video` drives the UI immediately.
+- **Switching camera device** is also a `replaceTrack` (new capture, then swap).
+- **Codec order:** H.264 (hardware), then VP9, then VP8. No simulcast: in a mesh each peer connection already has its own encoder, so quality is adjusted per viewer with `setParameters`.
+
+### 5a.3 Adaptive quality (mesh bandwidth)
+The sender sets a quality cap per viewer from two inputs:
+
+1. **Group size**, a sender-side default:
+
+| People in call | Camera send cap (per viewer) |
+|---|---|
+| 2–3 | 720p30, 1.5 Mbps |
+| 4–5 | 480p30, 800 kbps |
+| 6–8 | 360p24, 400 kbps |
+
+2. **The viewer's preference.** The viewer sends a signal (`{kind:'video-pref', camera:'off'|'low'|'high'}`) based on how big the tile is on their screen:
+   - `high`: a big tile in the grid.
+   - `low`: 180p15 at 150 kbps, for strip thumbnails while a stream is focused, or a small grid.
+   - `off`: the tile is off-screen, the app is minimized, or the viewer paused that camera. The sender sets `encodings[0].active = false` for that viewer, so no bandwidth is spent.
+
+On top of both, the same `getStats` adaptation as audio (§4.5) lowers bitrate on loss or bandwidth limits.
+
+### 5a.4 Protocol and API changes
+- `VoiceState.video: boolean`, and `voice.update { video? }`. Protocol v3.
+- `SignalData` gains `{kind:'video-pref', camera:'off'|'low'|'high'}`. It is peer to peer and relayed by the hub like other signals.
+- Engine additions:
+  - `startCamera(deviceId?)` and `stopCamera()`
+  - `setCameraDevice(id)`
+  - `setCameraPreference(userId, 'off'|'low'|'high')`
+  - event `remoteCamera {userId, stream|null}`
+  - event `localCamera {stream|null}` for the self-preview
+  - `streamStats` extended with `kind: 'screen'|'camera'`
+- Desktop app:
+  - camera button
+  - camera picker and live preview in Settings → Voice & Video
+  - video tiles
+  - `IntersectionObserver` and `visibilitychange` to drive `video-pref`
+
+### 5a.5 Testing
+The e2e harness already uses Chromium's fake devices, which include a fake camera (a moving test pattern). The tests cover:
+- Camera on reaches everyone at the expected cap for the group size.
+- Toggling off and on causes no renegotiation.
+- `video-pref: off` drops the received bytes to about 0.
+- Camera and screen share can run from the same user at the same time.
+- Device switching.
+- Stopping the camera releases the capture track (`readyState === 'ended'`).
+
+### 5a.6 Later
+- Background blur or replacement (MediaPipe selfie segmentation in a worker) and noise-free low-light boost.
+
+---
+
 ## 6. Text chat and the rest of the "Discord" part
 
 All of this runs on the hub (it isn't P2P, which keeps history reliable when people are offline).
@@ -326,7 +393,7 @@ Code signing: without a certificate, Windows SmartScreen shows a warning ("More 
 - Custom source picker, quality presets, codec preference (AV1 → H.264 HW → VP9).
 - Bitrate and SDP tuning, and the opt-in *Watch Stream* flow.
 - System audio capture (Windows first).
-- Camera video with adaptive per-peer quality.
+- Camera video with adaptive per-peer quality (see §5a).
 - Stream stats overlay, pop-out/fullscreen viewer.
 - ✅ *Milestone: 1440p60 game stream to 3 friends that looks sharp and smooth.*
 
