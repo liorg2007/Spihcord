@@ -1,0 +1,154 @@
+/**
+ * Shared contract between the hub server and the desktop client.
+ * Every WebSocket frame is a JSON object with a `type` discriminator,
+ * validated with zod on the receiving side.
+ */
+import { z } from "zod";
+
+export const PROTOCOL_VERSION = 1;
+
+// ---------------------------------------------------------------------------
+// Entities
+// ---------------------------------------------------------------------------
+
+export const UserSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  displayName: z.string(),
+});
+export type User = z.infer<typeof UserSchema>;
+
+export const ChannelSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  type: z.enum(["text", "voice"]),
+  position: z.number().int(),
+});
+export type Channel = z.infer<typeof ChannelSchema>;
+
+/** Where a user is in voice and their self-reported mic state. */
+export const VoiceStateSchema = z.object({
+  userId: z.string(),
+  channelId: z.string(),
+  muted: z.boolean(),
+  deafened: z.boolean(),
+});
+export type VoiceState = z.infer<typeof VoiceStateSchema>;
+
+/** Mirror of the browser RTCIceServer shape. */
+export const IceServerSchema = z.object({
+  urls: z.union([z.string(), z.array(z.string())]),
+  username: z.string().optional(),
+  credential: z.string().optional(),
+});
+export type IceServer = z.infer<typeof IceServerSchema>;
+
+/**
+ * Opaque WebRTC signaling payload, relayed verbatim by the hub.
+ * Perfect-negotiation style: either a session description or an ICE candidate.
+ */
+export const SignalDataSchema = z.union([
+  z.object({
+    kind: z.literal("description"),
+    description: z.object({
+      type: z.enum(["offer", "answer", "pranswer", "rollback"]),
+      sdp: z.string().optional(),
+    }),
+  }),
+  z.object({
+    kind: z.literal("candidate"),
+    candidate: z
+      .object({
+        candidate: z.string(),
+        sdpMid: z.string().nullable().optional(),
+        sdpMLineIndex: z.number().nullable().optional(),
+        usernameFragment: z.string().nullable().optional(),
+      })
+      .nullable(),
+  }),
+]);
+export type SignalData = z.infer<typeof SignalDataSchema>;
+
+// ---------------------------------------------------------------------------
+// HTTP API  (JSON, base path /api)
+// ---------------------------------------------------------------------------
+//
+// POST /api/register  RegisterRequest -> AuthResponse     (requires invite code)
+// POST /api/login     LoginRequest    -> AuthResponse
+// GET  /api/health    -> { ok: true, protocolVersion }
+// POST /api/invites   (Authorization: Bearer <token>, admin only) -> { code }
+// Errors: HTTP 4xx with ErrorResponse body.
+
+export const RegisterRequestSchema = z.object({
+  username: z.string().min(2).max(32).regex(/^[a-zA-Z0-9_.-]+$/),
+  password: z.string().min(6).max(128),
+  inviteCode: z.string().min(1),
+});
+export type RegisterRequest = z.infer<typeof RegisterRequestSchema>;
+
+export const LoginRequestSchema = z.object({
+  username: z.string(),
+  password: z.string(),
+});
+export type LoginRequest = z.infer<typeof LoginRequestSchema>;
+
+export const AuthResponseSchema = z.object({
+  token: z.string(),
+  user: UserSchema,
+});
+export type AuthResponse = z.infer<typeof AuthResponseSchema>;
+
+export const ErrorResponseSchema = z.object({
+  error: z.string(), // machine code, e.g. "invalid_credentials"
+  message: z.string(),
+});
+export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// WebSocket  (path /ws)
+// ---------------------------------------------------------------------------
+//
+// 1. Client connects and must send `auth` within 10s.
+// 2. Hub replies `ready` with a full snapshot (or `error` + close on failure,
+//    e.g. code "outdated_client" when protocolVersion mismatches).
+// 3. Hub sends `ping` every 25s; client answers `pong`.
+
+export const ClientMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("auth"), token: z.string(), protocolVersion: z.number().int() }),
+  z.object({ type: z.literal("pong") }),
+  /** Join (or switch to) a voice channel. Leaves the previous one implicitly. */
+  z.object({ type: z.literal("voice.join"), channelId: z.string() }),
+  z.object({ type: z.literal("voice.leave") }),
+  z.object({ type: z.literal("voice.update"), muted: z.boolean(), deafened: z.boolean() }),
+  /** Relay a WebRTC signal to another user in the same voice channel. */
+  z.object({ type: z.literal("rtc.signal"), to: z.string(), data: SignalDataSchema }),
+]);
+export type ClientMessage = z.infer<typeof ClientMessageSchema>;
+
+export const ServerMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("ready"),
+    self: UserSchema,
+    users: z.array(UserSchema),
+    onlineUserIds: z.array(z.string()),
+    channels: z.array(ChannelSchema),
+    voiceStates: z.array(VoiceStateSchema),
+    /** STUN + TURN (with ephemeral credentials) for RTCPeerConnection. */
+    iceServers: z.array(IceServerSchema),
+  }),
+  z.object({ type: z.literal("ping") }),
+  z.object({ type: z.literal("user.upsert"), user: UserSchema }),
+  z.object({ type: z.literal("presence.update"), userId: z.string(), online: z.boolean() }),
+  /** A user joined / switched / changed mute state in voice. */
+  z.object({ type: z.literal("voice.state"), voiceState: VoiceStateSchema }),
+  /** A user left voice (explicitly or by disconnecting). */
+  z.object({ type: z.literal("voice.left"), userId: z.string(), channelId: z.string() }),
+  z.object({ type: z.literal("rtc.signal"), from: z.string(), data: SignalDataSchema }),
+  /** Fresh TURN credentials before the old ones expire. */
+  z.object({ type: z.literal("ice.refresh"), iceServers: z.array(IceServerSchema) }),
+  z.object({ type: z.literal("error"), code: z.string(), message: z.string() }),
+]);
+export type ServerMessage = z.infer<typeof ServerMessageSchema>;
+
+export type ServerMessageOf<T extends ServerMessage["type"]> = Extract<ServerMessage, { type: T }>;
+export type ClientMessageOf<T extends ClientMessage["type"]> = Extract<ClientMessage, { type: T }>;
