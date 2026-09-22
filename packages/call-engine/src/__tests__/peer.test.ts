@@ -39,7 +39,8 @@ function makeSide(
       side.resets.push({ reason, replay });
       opts.onReset?.(reason, replay);
     },
-    timings: { connectTimeoutMs: 60_000, failedTeardownMs: 60_000, disconnectedGraceMs: 20 },
+    // politeInitialOfferDelayMs: 0 keeps both sides offering at once, so glare is still exercised.
+    timings: { connectTimeoutMs: 60_000, failedTeardownMs: 60_000, disconnectedGraceMs: 20, politeInitialOfferDelayMs: 0 },
   });
   created.push(peer);
   side.peer = peer;

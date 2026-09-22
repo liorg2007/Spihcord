@@ -7,7 +7,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "dev:hub": "npm run dev -w @shpihcord/hub",
-    "dev:desktop": "npm run dev -w @shpihcord/desktop"
+    "dev:desktop": "npm run dev -w @shpihcord/desktop",
+    "test:e2e": "vite build --config tests/e2e/vite.config.ts && electron tests/e2e/main.cjs"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

@@ -15,12 +15,20 @@ export interface PeerTimings {
   failedTeardownMs: number;
   /** Ask the owner to recreate the peer if it never connects within this long. */
   connectTimeoutMs: number;
+  /**
+   * The polite side does not send the *initial* offer; it waits this long for the
+   * impolite side's offer first. Avoids glare + implicit rollback on every new
+   * connection (Chromium can stall ICE gathering forever when a local offer is
+   * rolled back before gathering starts).
+   */
+  politeInitialOfferDelayMs: number;
 }
 
 export const DEFAULT_PEER_TIMINGS: PeerTimings = {
   disconnectedGraceMs: 5_000,
   failedTeardownMs: 30_000,
-  connectTimeoutMs: 30_000,
+  connectTimeoutMs: 15_000,
+  politeInitialOfferDelayMs: 3_000,
 };
 
 export type ResetReason = "failed" | "connect-timeout" | "remote-restarted" | "negotiation-error";
@@ -68,6 +76,7 @@ export class Peer {
   private closed = false;
   private resetRequested = false;
   private senderTuned = false;
+  private initialOfferTimer: ReturnType<typeof setTimeout> | undefined;
 
   private disconnectTimer: Timer | undefined;
   private teardownTimer: Timer | undefined;
@@ -219,8 +228,18 @@ export class Peer {
 
   // ---------------------------------------------------------------------------
 
-  private async negotiate(): Promise<void> {
+  private async negotiate(force = false): Promise<void> {
     if (this.closed) return;
+    if (!force && this.polite && !this.pc.currentRemoteDescription && !this.pc.currentLocalDescription) {
+      // Initial negotiation: let the impolite side offer; fall back to offering ourselves.
+      this.initialOfferTimer ??= setTimeout(() => {
+        this.initialOfferTimer = undefined;
+        if (!this.closed && !this.pc.currentRemoteDescription && this.pc.signalingState === "stable") {
+          void this.negotiate(true);
+        }
+      }, this.timings.politeInitialOfferDelayMs);
+      return;
+    }
     try {
       this.makingOffer = true;
       await this.pc.setLocalDescription();
@@ -298,6 +317,8 @@ export class Peer {
   }
 
   private clearTimers(): void {
+    if (this.initialOfferTimer) clearTimeout(this.initialOfferTimer);
+    this.initialOfferTimer = undefined;
     if (this.disconnectTimer) clearTimeout(this.disconnectTimer);
     if (this.teardownTimer) clearTimeout(this.teardownTimer);
     this.disconnectTimer = undefined;
