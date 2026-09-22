@@ -7,6 +7,7 @@ import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
 import { HashIcon, HeadphonesOffIcon, MicOffIcon, SpeakerIcon } from "./Icons";
 import { popoverTriggerProps } from "./UserPopover";
+import { LiveBadge } from "./Stream";
 import { UserPanel } from "./UserPanel";
 import { VoiceBar } from "./VoiceBar";
 
@@ -93,6 +94,8 @@ function VoiceParticipantRow({ vs, inMyCall }: { vs: VoiceState; inMyCall: boole
   const selfDeaf = useSettings((s) => s.selfDeafened);
   const locallyMuted = useSettings((s) => !!s.userMuted[vs.userId]);
   const isSelf = vs.userId === selfId;
+  const selfLive = useApp((s) => s.localShare?.status === "live");
+  const live = isSelf ? selfLive : vs.streaming;
   // Our own icons follow local state immediately; others come from the hub.
   const muted = isSelf ? selfMuted : vs.muted;
   const deafened = isSelf ? selfDeaf : vs.deafened;
@@ -102,6 +105,7 @@ function VoiceParticipantRow({ vs, inMyCall }: { vs: VoiceState; inMyCall: boole
       <Avatar userId={vs.userId} name={name} size={24} speaking={speaking} />
       <span className={`vp-name${speaking ? " speaking" : ""}`}>{name}</span>
       <span className="vp-icons">
+        {live && <LiveBadge small />}
         {locallyMuted && !isSelf && (
           <span title="Muted by you" className="vp-local-mute">
             <SpeakerIcon size={14} />

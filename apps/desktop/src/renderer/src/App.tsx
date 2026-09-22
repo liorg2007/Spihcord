@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { ChannelSidebar } from "./components/ChannelSidebar";
 import { FatalScreen } from "./components/FatalScreen";
+import { GoLiveModal } from "./components/GoLiveModal";
 import { LogoMark } from "./components/Icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { MainArea } from "./components/MainArea";
@@ -70,6 +71,7 @@ function AppShell() {
   const hasSnapshot = useApp((s) => s.hasSnapshot);
   const fatal = useApp((s) => s.fatal);
   const settingsOpen = useApp((s) => s.settingsOpen);
+  const goLiveOpen = useApp((s) => s.goLiveOpen);
   const showMembers = useSettings((s) => s.showMemberList);
 
   if (fatal) return <FatalScreen fatal={fatal} />;
@@ -82,6 +84,7 @@ function AppShell() {
       <MainArea />
       {showMembers && <MemberList />}
       <UserPopover />
+      {goLiveOpen && <GoLiveModal />}
       {settingsOpen && <SettingsModal />}
     </div>
   );

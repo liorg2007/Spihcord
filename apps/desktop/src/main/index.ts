@@ -10,6 +10,7 @@ import {
   setPttStateListener,
   shutdownPtt,
 } from "./ptt";
+import { getAudioSupport, getSources, selectSource, setupDisplayMediaHandler } from "./screen";
 
 const BG = "#1e1f22";
 let mainWindow: BrowserWindow | null = null;
@@ -136,7 +137,8 @@ function createTray(): void {
 
 function setupPermissions(): void {
   const ses = session.defaultSession;
-  // Microphone (and later camera) only; deny everything else.
+  // Microphone (and later camera) only; deny everything else. Screen capture
+  // ("Go Live") also asks for "media" and is gated by the display-media handler.
   ses.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(permission === "media");
   });
@@ -171,6 +173,17 @@ function setupIpc(): void {
   ipcMain.on(IPC.pttCancelRecord, (e) => {
     if (trusted(e)) cancelPttRecord();
   });
+
+  ipcMain.handle(IPC.screenGetSources, (e) => (trusted(e) ? getSources() : []));
+  ipcMain.handle(IPC.screenAudioSupport, (e) =>
+    trusted(e) ? getAudioSupport() : { system: false, excludesOwnAudio: false, appAudio: false },
+  );
+  ipcMain.handle(IPC.screenSelect, (e, req: unknown) =>
+    trusted(e) ? selectSource(req) : { ok: false, audio: "none", reason: "untrusted" },
+  );
+  setupDisplayMediaHandler(
+    (frame) => !!frame && !!mainWindow && !mainWindow.isDestroyed() && frame === mainWindow.webContents.mainFrame,
+  );
 
   setPttStateListener((pressed) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.pttState, pressed);

@@ -34,6 +34,52 @@ export interface PttRegisterResult {
   reason?: string;
 }
 
+/** A capturable screen or window, for the Go Live picker. */
+export interface ScreenSource {
+  /** desktopCapturer id, e.g. "screen:0:0" / "window:1234:0". */
+  id: string;
+  name: string;
+  kind: "screen" | "window";
+  /** JPEG data URL (empty string if the OS gave no thumbnail, e.g. minimized). */
+  thumbnail: string;
+  /** PNG data URL of the owning app's icon (windows only), or null. */
+  appIcon: string | null;
+  /** Display id for screens ("" for windows). */
+  displayId: string;
+}
+
+/**
+ * How stream audio is captured:
+ *  - "system": everything the PC plays, minus Shpihcord's own playback when
+ *    `excludesOwnAudio` (so friends don't hear themselves);
+ *  - "app": only the shared window's application (process tree);
+ *  - "none": video only.
+ */
+export type ScreenAudioMode = "system" | "app" | "none";
+
+export interface ScreenAudioSupport {
+  /** System audio can be captured on this platform. */
+  system: boolean;
+  /** Our own playback (voice chat) is excluded from system audio (best knowledge; verified per track). */
+  excludesOwnAudio: boolean;
+  /** "Share only this app's audio" is available for window shares. */
+  appAudio: boolean;
+  /** Shown in the picker when something is limited. */
+  note?: string;
+}
+
+export interface ScreenSelectRequest {
+  sourceId: string;
+  audio: ScreenAudioMode;
+}
+
+export interface ScreenSelectResult {
+  ok: boolean;
+  /** The audio mode actually granted (e.g. "app" falls back to "system" if the window's process is unknown). */
+  audio: ScreenAudioMode;
+  reason?: string;
+}
+
 export interface ShpihcordApi {
   platform: string;
   getVersion(): Promise<string>;
@@ -57,6 +103,15 @@ export interface ShpihcordApi {
     record(timeoutMs?: number): Promise<PttBinding | null>;
     cancelRecord(): void;
   };
+  screen: {
+    getSources(): Promise<ScreenSource[]>;
+    audioSupport(): Promise<ScreenAudioSupport>;
+    /**
+     * Arm the next getDisplayMedia() call with this source. Must be followed by
+     * getDisplayMedia within a few seconds; the selection is single-use.
+     */
+    select(req: ScreenSelectRequest): Promise<ScreenSelectResult>;
+  };
 }
 
 export const IPC = {
@@ -69,4 +124,7 @@ export const IPC = {
   pttState: "ptt:state",
   pttRecord: "ptt:record",
   pttCancelRecord: "ptt:cancel-record",
+  screenGetSources: "screen:getSources",
+  screenAudioSupport: "screen:audioSupport",
+  screenSelect: "screen:select",
 } as const;

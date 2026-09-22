@@ -27,6 +27,11 @@ function browserFallback(): ShpihcordApi {
       record: async () => null,
       cancelRecord: () => {},
     },
+    screen: {
+      getSources: async () => [],
+      audioSupport: async () => ({ system: false, excludesOwnAudio: false, appAudio: false, note: "Not running in Electron." }),
+      select: async () => ({ ok: false, audio: "none", reason: "not running in Electron" }),
+    },
   };
 }
 

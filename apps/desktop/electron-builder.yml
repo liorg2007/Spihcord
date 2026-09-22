@@ -10,7 +10,8 @@ files:
   - "!**/*.map"
 asarUnpack:
   - "**/node_modules/uiohook-napi/**"
-# uiohook-napi ships N-API prebuilds (ABI-stable), no rebuild against Electron needed.
+  - "**/node_modules/koffi/**"
+# uiohook-napi and koffi ship N-API prebuilds (ABI-stable), no rebuild against Electron needed.
 npmRebuild: false
 win:
   target:
@@ -34,3 +35,4 @@ mac:
   category: public.app-category.social-networking
   extendInfo:
     NSMicrophoneUsageDescription: Shpihcord needs the microphone for voice chat.
+    NSAudioCaptureUsageDescription: Shpihcord captures system audio when you share your screen.

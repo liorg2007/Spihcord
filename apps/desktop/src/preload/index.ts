@@ -3,7 +3,7 @@
  * Built as CommonJS (sandboxed preloads can't be ES modules).
  */
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from "electron";
-import { IPC, type PttBinding, type ShpihcordApi, type StoredSession } from "../shared/ipc";
+import { IPC, type PttBinding, type ScreenSelectRequest, type ShpihcordApi, type StoredSession } from "../shared/ipc";
 
 const api: ShpihcordApi = {
   platform: process.platform,
@@ -26,6 +26,12 @@ const api: ShpihcordApi = {
     },
     record: (timeoutMs?: number) => ipcRenderer.invoke(IPC.pttRecord, timeoutMs),
     cancelRecord: () => ipcRenderer.send(IPC.pttCancelRecord),
+  },
+  screen: {
+    getSources: () => ipcRenderer.invoke(IPC.screenGetSources),
+    audioSupport: () => ipcRenderer.invoke(IPC.screenAudioSupport),
+    select: (req: ScreenSelectRequest) =>
+      ipcRenderer.invoke(IPC.screenSelect, { sourceId: req.sourceId, audio: req.audio }),
   },
 };
 

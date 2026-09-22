@@ -1,11 +1,22 @@
 import { useMemo } from "react";
 import type { Channel, VoiceState } from "@shpihcord/protocol";
 import { peerBadge } from "../lib/format";
-import { joinVoice, leaveVoice, toggleDeafen, toggleMute } from "../lib/voice";
+import { joinVoice, leaveVoice, openGoLive, stopScreenShare, toggleDeafen, toggleMute, watchStream } from "../lib/voice";
 import { displayNameOf, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { HangupIcon, HeadphonesIcon, HeadphonesOffIcon, MicIcon, MicOffIcon, SpeakerIcon } from "./Icons";
+import {
+  EyeIcon,
+  HangupIcon,
+  HeadphonesIcon,
+  HeadphonesOffIcon,
+  MicIcon,
+  MicOffIcon,
+  ScreenShareIcon,
+  ScreenShareOffIcon,
+  SpeakerIcon,
+} from "./Icons";
+import { LiveBadge, LiveBar, StreamStage, StreamVideo } from "./Stream";
 import { popoverTriggerProps } from "./UserPopover";
 
 export function VoiceView({ channel }: { channel: Channel }) {
@@ -13,6 +24,7 @@ export function VoiceView({ channel }: { channel: Channel }) {
   const myChannel = useApp((s) => s.voiceChannelId);
   const status = useApp((s) => s.voiceStatus);
   const connection = useApp((s) => s.connection);
+  const focused = useApp((s) => s.focusedStream);
   const participants = useMemo(
     () => Object.values(voiceStates).filter((v) => v.channelId === channel.id).sort((a, b) => a.userId.localeCompare(b.userId)),
     [voiceStates, channel.id],
@@ -49,14 +61,27 @@ export function VoiceView({ channel }: { channel: Channel }) {
 
   const count = participants.length;
   const cols = count <= 1 ? 1 : count <= 4 ? 2 : count <= 9 ? 3 : 4;
+  const stageUser = focused && participants.some((p) => p.userId === focused) ? focused : null;
   return (
     <div className="voice-view">
-      <div className="tile-grid" style={{ ["--cols" as string]: cols }}>
-        {participants.map((vs) => (
-          <ParticipantTile key={vs.userId} vs={vs} />
-        ))}
-        {count === 0 && <div className="muted">{status === "connecting" ? "Connecting…" : "Joining…"}</div>}
-      </div>
+      <LiveBar />
+      {stageUser ? (
+        <div className="stage-layout">
+          <StreamStage userId={stageUser} />
+          <div className="tile-strip">
+            {participants.map((vs) => (
+              <ParticipantTile key={vs.userId} vs={vs} compact />
+            ))}
+          </div>
+        </div>
+      ) : (
+        <div className="tile-grid" style={{ ["--cols" as string]: cols }}>
+          {participants.map((vs) => (
+            <ParticipantTile key={vs.userId} vs={vs} />
+          ))}
+          {count === 0 && <div className="muted">{status === "connecting" ? "Connecting…" : "Joining…"}</div>}
+        </div>
+      )}
       <CallControls />
     </div>
   );
@@ -72,7 +97,7 @@ function PreviewAvatar({ vs }: { vs: VoiceState }) {
   );
 }
 
-function ParticipantTile({ vs }: { vs: VoiceState }) {
+function ParticipantTile({ vs, compact }: { vs: VoiceState; compact?: boolean }) {
   const users = useApp((s) => s.users);
   const selfId = useApp((s) => s.self?.id);
   const speaking = useApp((s) => !!s.speaking[vs.userId]);
@@ -86,16 +111,44 @@ function ParticipantTile({ vs }: { vs: VoiceState }) {
   const muted = isSelf ? selfMuted : vs.muted;
   const deafened = isSelf ? selfDeaf : vs.deafened;
   const badge = isSelf ? null : peerBadge(peer);
+  const localStream = useApp((s) => (isSelf && s.localShare?.status === "live" ? s.localShare.stream : null));
+  const focused = useApp((s) => s.focusedStream === vs.userId);
+  const connected = useApp((s) => s.voiceStatus === "connected");
+  // Our own LIVE state is local (instant); others' comes from the hub.
+  const live = isSelf ? !!localStream : vs.streaming;
 
   return (
     <div
-      className={`tile${speaking ? " speaking" : ""}`}
+      className={`tile${speaking ? " speaking" : ""}${compact ? " compact" : ""}${focused ? " focused" : ""}${live ? " live" : ""}`}
       {...popoverTriggerProps(vs.userId, !isSelf)}
       title={isSelf ? undefined : "Click for volume and mute"}
     >
-      <div className="tile-center">
-        <Avatar userId={vs.userId} name={name} size={88} speaking={speaking} dim={locallyMuted} />
-      </div>
+      {localStream && !focused ? (
+        <StreamVideo stream={localStream} className="tile-video" />
+      ) : (
+        <div className="tile-center">
+          <Avatar userId={vs.userId} name={name} size={compact ? 48 : 88} speaking={speaking} dim={locallyMuted} />
+        </div>
+      )}
+      {live && (
+        <div className="tile-live">
+          <LiveBadge small={compact} />
+        </div>
+      )}
+      {live && !focused && connected && (
+        <div className="tile-watch">
+          <button
+            className="btn btn-small btn-primary"
+            onClick={(e) => {
+              e.stopPropagation();
+              watchStream(vs.userId);
+            }}
+            onContextMenu={(e) => e.stopPropagation()}
+          >
+            <EyeIcon size={16} /> {isSelf ? "Preview" : "Watch Stream"}
+          </button>
+        </div>
+      )}
       <div className="tile-footer">
         <span className="tile-name">
           {name}
@@ -111,7 +164,7 @@ function ParticipantTile({ vs }: { vs: VoiceState }) {
           {deafened ? <HeadphonesOffIcon size={16} /> : muted ? <MicOffIcon size={16} /> : null}
         </span>
       </div>
-      {badge && (
+      {badge && !compact && (
         <div className={`conn-badge tone-${badge.tone}`} title={badge.detail}>
           <span className="dot" />
           {badge.label}
@@ -124,6 +177,8 @@ function ParticipantTile({ vs }: { vs: VoiceState }) {
 function CallControls() {
   const muted = useSettings((s) => s.selfMuted);
   const deafened = useSettings((s) => s.selfDeafened);
+  const connected = useApp((s) => s.voiceStatus === "connected");
+  const sharing = useApp((s) => !!s.localShare);
   const mutedAny = muted || deafened;
   return (
     <div className="call-controls">
@@ -132,6 +187,14 @@ function CallControls() {
       </button>
       <button className={`round-btn${deafened ? " off" : ""}`} onClick={toggleDeafen} title={deafened ? "Undeafen" : "Deafen"}>
         {deafened ? <HeadphonesOffIcon size={22} /> : <HeadphonesIcon size={22} />}
+      </button>
+      <button
+        className={`round-btn${sharing ? " live" : ""}`}
+        onClick={() => (sharing ? stopScreenShare() : openGoLive())}
+        disabled={!connected && !sharing}
+        title={sharing ? "Stop Streaming" : "Share Your Screen"}
+      >
+        {sharing ? <ScreenShareOffIcon size={22} /> : <ScreenShareIcon size={22} />}
       </button>
       <button className="round-btn hangup" onClick={() => leaveVoice()} title="Disconnect">
         <HangupIcon size={26} />

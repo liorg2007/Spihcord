@@ -1,6 +1,6 @@
 /** User preferences, persisted in localStorage. */
 import { create } from "zustand";
-import type { InputMode } from "@shpihcord/call-engine";
+import type { InputMode, ScreenSharePresetId } from "@shpihcord/call-engine";
 import type { PttBinding } from "../../../shared/ipc";
 
 export interface Settings {
@@ -23,6 +23,16 @@ export interface Settings {
   selfDeafened: boolean;
   soundsEnabled: boolean;
   showMemberList: boolean;
+  /** Last used Go Live quality preset. */
+  screenPreset: ScreenSharePresetId;
+  /** Share audio with the stream; null = platform default (on only where our own audio is excluded). */
+  screenAudio: boolean | null;
+  /** For window shares: only that app's audio (Windows 11). */
+  screenAppAudioOnly: boolean;
+  /** Per-sharer stream audio volume 0..2 (1 = 100%). */
+  streamVolumes: Record<string, number>;
+  /** Show the stats overlay on watched streams. */
+  streamStatsOverlay: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -41,6 +51,11 @@ export const DEFAULT_SETTINGS: Settings = {
   selfDeafened: false,
   soundsEnabled: true,
   showMemberList: true,
+  screenPreset: "balanced",
+  screenAudio: null,
+  screenAppAudioOnly: false,
+  streamVolumes: {},
+  streamStatsOverlay: false,
 };
 
 const KEY = "shpihcord.settings.v1";
@@ -57,6 +72,8 @@ function load(): Settings {
     merged.vadThreshold = Math.min(1, Math.max(0, merged.vadThreshold));
     if (!merged.userVolumes || typeof merged.userVolumes !== "object") merged.userVolumes = {};
     if (!merged.userMuted || typeof merged.userMuted !== "object") merged.userMuted = {};
+    if (!merged.streamVolumes || typeof merged.streamVolumes !== "object") merged.streamVolumes = {};
+    if (!["text", "balanced", "gaming", "source"].includes(merged.screenPreset)) merged.screenPreset = DEFAULT_SETTINGS.screenPreset;
     return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -75,6 +92,7 @@ interface SettingsStore extends Settings {
   update(patch: Partial<Settings>): void;
   setUserVolume(userId: string, volume: number): void;
   setUserMuted(userId: string, muted: boolean): void;
+  setStreamVolume(userId: string, volume: number): void;
 }
 
 export const useSettings = create<SettingsStore>()((set, get) => ({
@@ -83,13 +101,15 @@ export const useSettings = create<SettingsStore>()((set, get) => ({
   setUserVolume: (userId, volume) =>
     set({ userVolumes: { ...get().userVolumes, [userId]: Math.min(2, Math.max(0, volume)) } }),
   setUserMuted: (userId, muted) => set({ userMuted: { ...get().userMuted, [userId]: muted } }),
+  setStreamVolume: (userId, volume) =>
+    set({ streamVolumes: { ...get().streamVolumes, [userId]: Math.min(2, Math.max(0, volume)) } }),
 }));
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 useSettings.subscribe((state) => {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const { update: _u, setUserVolume: _v, setUserMuted: _m, ...data } = state;
+    const { update: _u, setUserVolume: _v, setUserMuted: _m, setStreamVolume: _s, ...data } = state;
     save(data);
   }, 150);
 });

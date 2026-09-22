@@ -3,11 +3,21 @@
  * channels, keeps the mesh in sync with voice states, and applies local
  * controls (mute/deafen/PTT/devices) to the active call.
  */
-import { createVoiceCall, type PeerInfo, type SignalingTransport, type VoiceCall } from "@shpihcord/call-engine";
+import {
+  createVoiceCall,
+  SCREEN_SHARE_PRESETS,
+  type PeerInfo,
+  type ScreenSharePresetId,
+  type SignalingTransport,
+  type StreamStats,
+  type VoiceCall,
+} from "@shpihcord/call-engine";
 import type { ServerMessage, SignalData, VoiceState } from "@shpihcord/protocol";
-import { getApp, setApp, toast } from "../store/app";
+import type { ScreenAudioMode, ScreenAudioSupport } from "../../../shared/ipc";
+import { getApp, setApp, toast, type AppState } from "../store/app";
 import { getSettings, useSettings, type Settings } from "../store/settings";
 import type { HubClient } from "./hub";
+import { bridge } from "./bridge";
 import { playSound, setSoundOutputDevice } from "./sounds";
 
 let hub: HubClient | null = null;
@@ -19,6 +29,8 @@ let generation = 0;
 /** After sending voice.join, ignore our own voice.left until the hub confirms the join. */
 let awaitingSelfState = false;
 let lastSyncKey = "";
+/** Bumped on every Go Live attempt / stop; a stale getDisplayMedia result is discarded. */
+let shareSeq = 0;
 const levelListeners = new Set<(level: number) => void>();
 
 // ---------------------------------------------------------------------------
@@ -91,6 +103,8 @@ export function handleServerMessage(msg: ServerMessage, prevVoiceStates: Record<
         break;
       }
       const before = prevVoiceStates[vs.userId]?.channelId;
+      // The sharer we're watching stopped streaming or left: back to the grid.
+      if (app.focusedStream === vs.userId && (!vs.streaming || vs.channelId !== myChannel)) stopWatching(vs.userId);
       if (myChannel && app.voiceStatus === "connected") {
         if (before !== myChannel && vs.channelId === myChannel) playSound("peerJoin");
         else if (before === myChannel && vs.channelId !== myChannel) playSound("peerLeave");
@@ -107,6 +121,7 @@ export function handleServerMessage(msg: ServerMessage, prevVoiceStates: Record<
         }
         break;
       }
+      if (app.focusedStream === msg.userId) stopWatching(msg.userId);
       if (myChannel && msg.channelId === myChannel && app.voiceStatus === "connected") playSound("peerLeave");
       syncPeers();
       break;
@@ -141,6 +156,9 @@ function teardownCall(): void {
   signaling?.dispose();
   signaling = null;
   lastSyncKey = "";
+  // call.close() stopped our share and all received streams.
+  shareSeq++;
+  setApp({ localShare: null, focusedStream: null, remoteStreams: {}, streamStats: {}, goLiveOpen: false });
 }
 
 function describeMediaError(err: unknown): string {
@@ -234,6 +252,37 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
     }),
     c.on("localLevel", ({ level }) => {
       for (const fn of levelListeners) fn(level);
+    }),
+    c.on("remoteScreen", ({ userId, stream }) => {
+      if (gen !== generation) return;
+      setApp((st) => {
+        const remoteStreams = { ...st.remoteStreams };
+        if (stream) remoteStreams[userId] = stream;
+        else delete remoteStreams[userId];
+        return { remoteStreams, focusedStream: !stream && st.focusedStream === userId ? null : st.focusedStream };
+      });
+      if (stream) c.setStreamVolume(userId, getSettings().streamVolumes[userId] ?? 1);
+    }),
+    c.on("localScreenEnded", () => {
+      if (gen !== generation) return;
+      stopScreenShare("ended");
+    }),
+    c.on("viewers", ({ userIds }) => {
+      if (gen !== generation) return;
+      setApp((st) => {
+        if (!st.localShare) return {};
+        // Drop send stats of viewers that left.
+        const streamStats = { ...st.streamStats };
+        for (const key of Object.keys(streamStats)) {
+          if (key.startsWith("send:") && !userIds.includes(key.slice(5))) delete streamStats[key];
+        }
+        return { localShare: { ...st.localShare, viewers: [...userIds] }, streamStats };
+      });
+    }),
+    c.on("streamStats", (stats) => {
+      if (gen !== generation) return;
+      const key = statsKey(stats);
+      setApp((st) => ({ streamStats: { ...st.streamStats, [key]: stats } }));
     }),
     c.on("error", ({ message, cause }) => {
       if (gen !== generation) return;
@@ -386,3 +435,249 @@ useSettings.subscribe((s: Settings, prev: Settings) => {
   if (s.inputMode !== prev.inputMode) c.setInputMode(s.inputMode);
   if (s.vadThreshold !== prev.vadThreshold) c.setVadThreshold(s.vadThreshold);
 });
+
+// ---------------------------------------------------------------------------
+// Screen share ("Go Live")
+// ---------------------------------------------------------------------------
+
+function statsKey(s: StreamStats): string {
+  return s.direction === "send" ? `send:${s.viewerId ?? ""}` : `recv:${s.userId}`;
+}
+
+let audioSupport: Promise<ScreenAudioSupport> | null = null;
+export function getScreenAudioSupport(): Promise<ScreenAudioSupport> {
+  audioSupport ??= bridge.screen.audioSupport().catch(() => ({ system: false, excludesOwnAudio: false, appAudio: false }));
+  return audioSupport;
+}
+
+/** Audio constraints for getDisplayMedia: raw (no voice processing), and without our own playback. */
+function displayAudioConstraints(mode: ScreenAudioMode): MediaTrackConstraints | false {
+  if (mode === "none") return false;
+  return {
+    // Electron >= 43.4/44 maps "loopback" + restrictOwnAudio to Chromium's
+    // "loopbackWithoutChrome" (system audio minus this app's process tree).
+    // Not in TS's DOM lib yet, hence the cast.
+    ...(mode === "system" ? { restrictOwnAudio: true } : {}),
+    suppressLocalAudioPlayback: false,
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 2,
+  } as MediaTrackConstraints;
+}
+
+/** Inspect the captured audio track; returns what is really shared and a warning if needed. */
+function checkShareAudio(
+  stream: MediaStream,
+  granted: ScreenAudioMode,
+  support: ScreenAudioSupport,
+): { audio: ScreenAudioMode; warning: string | null } {
+  if (granted === "none") return { audio: "none", warning: null };
+  const track = stream.getAudioTracks()[0];
+  if (!track) return { audio: "none", warning: "Couldn't capture audio on this system, so your stream has no sound." };
+  if (granted === "app") return { audio: "app", warning: null };
+  const st = track.getSettings() as MediaTrackSettings & { restrictOwnAudio?: boolean };
+  const excluded = st.restrictOwnAudio === true || st.deviceId === "loopbackWithoutChrome";
+  if (excluded) return { audio: "system", warning: null };
+  return {
+    audio: "system",
+    warning:
+      support.note && !support.excludesOwnAudio
+        ? support.note
+        : "Your stream audio includes voice chat, so friends may hear themselves. Turn off stream audio if that's a problem.",
+  };
+}
+
+function describeCaptureError(err: unknown): string {
+  const name = err instanceof Error || err instanceof DOMException ? (err as Error).name : "";
+  switch (name) {
+    case "NotAllowedError":
+      return bridge.platform === "darwin"
+        ? "Screen recording isn't allowed. Enable Shpihcord in System Settings → Privacy & Security → Screen & System Audio Recording."
+        : "Screen capture was blocked.";
+    case "AbortError":
+    case "NotReadableError":
+      return "Couldn't capture that screen or window. It may have closed; pick another one.";
+    default:
+      return `Couldn't go live: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function sendStreaming(streaming: boolean): void {
+  const s = getSettings();
+  if (getApp().voiceChannelId) hub?.send({ type: "voice.update", muted: s.selfMuted, deafened: s.selfDeafened, streaming });
+}
+
+export interface GoLiveOptions {
+  sourceId: string;
+  sourceName: string;
+  preset: ScreenSharePresetId;
+  audio: ScreenAudioMode;
+}
+
+/** Capture the chosen source and start sharing it. Resolves true when live. */
+export async function startScreenShare(opts: GoLiveOptions): Promise<boolean> {
+  const c = call;
+  if (!c || !hub || getApp().voiceStatus !== "connected") {
+    toast("Join a voice channel to go live.", "error");
+    return false;
+  }
+  const gen = generation;
+  const seq = ++shareSeq;
+  const stale = () => gen !== generation || seq !== shareSeq || call !== c;
+  const prev = getApp().localShare;
+  if (!prev) {
+    setApp({
+      localShare: {
+        status: "starting",
+        preset: opts.preset,
+        sourceName: opts.sourceName,
+        audio: opts.audio,
+        audioWarning: null,
+        stream: null,
+        viewers: [],
+      },
+    });
+  }
+
+  let stream: MediaStream | null = null;
+  try {
+    const support = await getScreenAudioSupport();
+    const sel = await bridge.screen.select({ sourceId: opts.sourceId, audio: opts.audio });
+    if (!sel.ok) throw new Error(sel.reason ?? "that source isn't available");
+    if (sel.reason) toast(sel.reason, "info");
+    const p = SCREEN_SHARE_PRESETS[opts.preset];
+    // Without an explicit frameRate Chromium captures the desktop at 30 fps.
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {
+        frameRate: { ideal: p.frameRate, max: p.frameRate },
+        width: { max: p.maxWidth },
+        height: { max: p.maxHeight },
+      },
+      audio: displayAudioConstraints(sel.audio),
+    });
+    if (stale()) {
+      stream.getTracks().forEach((t) => t.stop());
+      return false;
+    }
+    const { audio, warning } = checkShareAudio(stream, sel.audio, support);
+    await c.startScreenShare(stream, opts.preset);
+    if (stale()) {
+      if (call === c) c.stopScreenShare();
+      return false;
+    }
+    sendStreaming(true);
+    setApp((st) => ({
+      localShare: {
+        status: "live",
+        preset: opts.preset,
+        sourceName: opts.sourceName,
+        audio,
+        audioWarning: warning,
+        stream,
+        viewers: st.localShare?.viewers ?? [],
+      },
+    }));
+    if (warning) toast(warning, "info", 9000);
+    return true;
+  } catch (err) {
+    stream?.getTracks().forEach((t) => t.stop());
+    if (stale()) return false;
+    console.error("[screen] go live failed", err);
+    toast(describeCaptureError(err), "error", 8000);
+    // Keep a previous live share running if this was a source switch.
+    if (!prev) setApp({ localShare: null });
+    else if (call === c && !c.isScreenSharing()) stopScreenShare();
+    return false;
+  }
+}
+
+export function stopScreenShare(reason?: "ended"): void {
+  shareSeq++;
+  const had = getApp().localShare;
+  if (!had) return;
+  try {
+    call?.stopScreenShare();
+  } catch (err) {
+    console.warn("[screen] stop failed", err);
+  }
+  const selfId = getApp().self?.id;
+  setApp((st) => {
+    const streamStats = { ...st.streamStats };
+    for (const key of Object.keys(streamStats)) if (key.startsWith("send:")) delete streamStats[key];
+    return { localShare: null, focusedStream: st.focusedStream === selfId ? null : st.focusedStream, streamStats };
+  });
+  if (had.status === "live") sendStreaming(false);
+  if (reason === "ended") toast("Your stream ended (the shared window or screen went away).", "info");
+}
+
+export async function setScreenSharePreset(preset: ScreenSharePresetId): Promise<void> {
+  useSettings.getState().update({ screenPreset: preset });
+  const share = getApp().localShare;
+  if (!call || !share || share.status !== "live" || share.preset === preset) return;
+  const before = share.preset;
+  setApp((st) => (st.localShare ? { localShare: { ...st.localShare, preset } } : {}));
+  try {
+    await call.setScreenSharePreset(preset);
+  } catch (err) {
+    setApp((st) => (st.localShare ? { localShare: { ...st.localShare, preset: before } } : {}));
+    toast(`Couldn't change stream quality: ${err instanceof Error ? err.message : String(err)}`, "error");
+  }
+}
+
+/** Focus a stream: start receiving a remote share, or show our own preview. */
+export function watchStream(userId: string): void {
+  const app = getApp();
+  if (userId === app.self?.id) {
+    if (app.localShare) setApp({ focusedStream: userId });
+    return;
+  }
+  if (!call) return;
+  const prev = app.focusedStream;
+  if (prev === userId) return;
+  if (prev && prev !== app.self?.id) stopWatching(prev);
+  call.watchStream(userId, true);
+  call.setStreamVolume(userId, getSettings().streamVolumes[userId] ?? 1);
+  setApp({ focusedStream: userId });
+}
+
+export function stopWatching(userId?: string): void {
+  const app = getApp();
+  const id = userId ?? app.focusedStream;
+  if (!id) return;
+  if (id !== app.self?.id) {
+    try {
+      call?.watchStream(id, false);
+    } catch (err) {
+      console.warn("[screen] unwatch failed", err);
+    }
+  }
+  setApp((st) => {
+    const patch: Partial<AppState> = {};
+    if (st.remoteStreams[id]) {
+      const remoteStreams = { ...st.remoteStreams };
+      delete remoteStreams[id];
+      patch.remoteStreams = remoteStreams;
+    }
+    if (st.streamStats[`recv:${id}`]) {
+      const streamStats = { ...st.streamStats };
+      delete streamStats[`recv:${id}`];
+      patch.streamStats = streamStats;
+    }
+    if (st.focusedStream === id) patch.focusedStream = null;
+    return patch;
+  });
+}
+
+export function setStreamVolume(userId: string, volume: number): void {
+  useSettings.getState().setStreamVolume(userId, volume);
+  call?.setStreamVolume(userId, Math.min(2, Math.max(0, volume)));
+}
+
+export function openGoLive(): void {
+  if (!call || getApp().voiceStatus !== "connected") {
+    toast("Join a voice channel to go live.", "error");
+    return;
+  }
+  setApp({ goLiveOpen: true });
+}

@@ -1,8 +1,8 @@
 /** Runtime app state: session, hub snapshot, voice call state, toasts. */
 import { create } from "zustand";
 import type { Channel, IceServer, ServerMessage, User, VoiceState } from "@shpihcord/protocol";
-import type { PeerInfo } from "@shpihcord/call-engine";
-import type { StoredSession } from "../../../shared/ipc";
+import type { PeerInfo, ScreenSharePresetId, StreamStats } from "@shpihcord/call-engine";
+import type { ScreenAudioMode, StoredSession } from "../../../shared/ipc";
 import type { HubFatal, HubStatus } from "../lib/hub";
 
 export type Screen = "loading" | "login" | "app";
@@ -12,6 +12,21 @@ export interface Toast {
   id: number;
   kind: "info" | "error" | "success";
   message: string;
+}
+
+/** Our own screen share ("Go Live"). */
+export interface LocalShare {
+  status: "starting" | "live";
+  preset: ScreenSharePresetId;
+  sourceName: string;
+  /** Audio actually being shared. */
+  audio: ScreenAudioMode;
+  /** Shown while live, e.g. "friends may hear themselves". */
+  audioWarning: string | null;
+  /** The captured stream (for the local preview). */
+  stream: MediaStream | null;
+  /** Users currently receiving our stream. */
+  viewers: string[];
 }
 
 export interface AppState {
@@ -44,6 +59,16 @@ export interface AppState {
   /** Whether PTT is using the global (system-wide) hook. */
   pttGlobal: boolean;
 
+  /** Go Live picker open. */
+  goLiveOpen: boolean;
+  localShare: LocalShare | null;
+  /** The stream shown in the stage (a sharer's userId, or our own id for the local preview). */
+  focusedStream: string | null;
+  /** Remote screen streams we are receiving, by sharer. */
+  remoteStreams: Record<string, MediaStream>;
+  /** Latest stats per stream: key `send:<viewerId>` or `recv:<userId>`. */
+  streamStats: Record<string, StreamStats>;
+
   settingsOpen: boolean;
   toasts: Toast[];
 }
@@ -69,6 +94,11 @@ const initial: AppState = {
   speaking: {},
   pttActive: false,
   pttGlobal: false,
+  goLiveOpen: false,
+  localShare: null,
+  focusedStream: null,
+  remoteStreams: {},
+  streamStats: {},
   settingsOpen: false,
   toasts: [],
 };

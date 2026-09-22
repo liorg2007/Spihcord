@@ -52,3 +52,9 @@ export function hostOf(url: string): string {
     return url;
   }
 }
+
+/** 6_000_000 -> "6 Mbps", 12_500_000 -> "12.5 Mbps". */
+export function formatMbps(bitsPerSecond: number): string {
+  const mbps = bitsPerSecond / 1_000_000;
+  return `${mbps >= 10 || Number.isInteger(mbps) ? Math.round(mbps) : mbps.toFixed(1)} Mbps`;
+}

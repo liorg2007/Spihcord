@@ -1,7 +1,8 @@
 import { useMemo } from "react";
-import { leaveVoice } from "../lib/voice";
+import { leaveVoice, openGoLive, stopScreenShare } from "../lib/voice";
 import { useApp } from "../store/app";
-import { HangupIcon, SignalIcon } from "./Icons";
+import { HangupIcon, ScreenShareIcon, ScreenShareOffIcon, SignalIcon } from "./Icons";
+import { LiveBadge } from "./Stream";
 
 /** The "Voice Connected" panel above the user panel. */
 export function VoiceBar() {
@@ -10,6 +11,7 @@ export function VoiceBar() {
   const channel = useApp((s) => s.channels.find((c) => c.id === s.voiceChannelId));
   const peers = useApp((s) => s.peers);
   const hub = useApp((s) => s.connection);
+  const share = useApp((s) => s.localShare);
 
   const { ping, tone } = useMemo(() => {
     const list = Object.values(peers);
@@ -26,25 +28,46 @@ export function VoiceBar() {
   const peerCount = Object.keys(peers).length;
 
   return (
-    <div className="voice-bar">
-      <div className="voice-bar-info">
-        <div className={`voice-bar-status ${connecting ? "tone-warn" : `tone-${tone}`}`}>
-          <SignalIcon size={16} />
-          <span>{label}</span>
+    <div className="voice-bar-wrap">
+      <div className="voice-bar">
+        <div className="voice-bar-info">
+          <div className={`voice-bar-status ${connecting ? "tone-warn" : `tone-${tone}`}`}>
+            <SignalIcon size={16} />
+            <span>{label}</span>
+          </div>
+          <div className="voice-bar-sub">
+            <span className="voice-bar-channel">{channel?.name ?? "Voice"}</span>
+            {!connecting && (
+              <span className="voice-bar-ping" title="Average round-trip time to peers">
+                {" · "}
+                {peerCount === 0 ? "alone" : ping !== undefined ? `${ping} ms` : "measuring…"}
+              </span>
+            )}
+          </div>
         </div>
-        <div className="voice-bar-sub">
-          <span className="voice-bar-channel">{channel?.name ?? "Voice"}</span>
-          {!connecting && (
-            <span className="voice-bar-ping" title="Average round-trip time to peers">
-              {" · "}
-              {peerCount === 0 ? "alone" : ping !== undefined ? `${ping} ms` : "measuring…"}
-            </span>
-          )}
-        </div>
+        <button className="icon-btn danger" onClick={() => leaveVoice()} title="Disconnect" aria-label="Disconnect">
+          <HangupIcon size={20} />
+        </button>
       </div>
-      <button className="icon-btn danger" onClick={() => leaveVoice()} title="Disconnect" aria-label="Disconnect">
-        <HangupIcon size={20} />
-      </button>
+      {share?.status === "live" && (
+        <div className="voice-bar-live">
+          <LiveBadge small />
+          <span>
+            {share.viewers.length} {share.viewers.length === 1 ? "viewer" : "viewers"}
+          </span>
+        </div>
+      )}
+      <div className="voice-bar-actions">
+        <button
+          className={`voice-bar-btn${share ? " live" : ""}`}
+          onClick={() => (share ? stopScreenShare() : openGoLive())}
+          disabled={connecting && !share}
+          title={share ? "Stop Streaming" : "Share Your Screen"}
+        >
+          {share ? <ScreenShareOffIcon size={18} /> : <ScreenShareIcon size={18} />}
+          <span>{share ? "Stop Stream" : "Screen"}</span>
+        </button>
+      </div>
     </div>
   );
 }
