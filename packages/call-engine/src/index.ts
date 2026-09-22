@@ -1,7 +1,6 @@
 export * from "./types";
 import type { CreateVoiceCall } from "./types";
+import { VoiceCallImpl } from "./voiceCall";
 
-// STUB: replaced by the real implementation.
-export const createVoiceCall: CreateVoiceCall = () => {
-  throw new Error("call-engine not implemented yet");
-};
+/** Create a full-mesh WebRTC voice call. Browser (Electron renderer) only. */
+export const createVoiceCall: CreateVoiceCall = (options) => new VoiceCallImpl(options);
