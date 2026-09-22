@@ -172,3 +172,88 @@ describe("Peer perfect negotiation", () => {
     expect(a.errors).toEqual([]);
   });
 });
+
+describe("Peer renegotiation (screen tracks added mid-call)", () => {
+  function makeSlowPoliteSide(net: FakeNetwork, id: string, remote: string, extra: Partial<PeerOptions> = {}): Side {
+    let pc!: FakePC;
+    const side = { id, errors: [], resets: [], tracks: [] } as unknown as Side;
+    const peer = new Peer({
+      userId: remote,
+      polite: isPolite(id, remote),
+      config: { iceServers: [] },
+      createPc: (config) => {
+        pc = new FakePC(config);
+        return pc as unknown as RTCPeerConnection;
+      },
+      localTrack: { id: `track-${id}`, kind: "audio" } as unknown as MediaStreamTrack,
+      send: (data) => net.send(id, remote, data),
+      onTrack: (track) => side.tracks.push(track.id),
+      onError: (m) => side.errors.push(m),
+      onReset: (reason, replay) => side.resets.push({ reason, replay }),
+      // A long initial-offer delay: a renegotiation must NOT go through it.
+      timings: { connectTimeoutMs: 60_000, failedTeardownMs: 60_000, disconnectedGraceMs: 20, politeInitialOfferDelayMs: 10_000 },
+      ...extra,
+    });
+    created.push(peer);
+    side.peer = peer;
+    side.pc = pc;
+    net.register(id, (_from, data) => void side.peer.handleSignal(data));
+    return side;
+  }
+
+  it("the polite side renegotiates immediately (no initial-offer wait) when it adds a track", async () => {
+    const net = new FakeNetwork(() => 2);
+    const a = makeSlowPoliteSide(net, "a", "b"); // polite
+    const b = makeSlowPoliteSide(net, "b", "a"); // impolite: sends the initial offer
+    await waitFor(() => settled(a, b), 2000, "initial");
+    const t = Date.now();
+    a.pc.addTransceiver(); // screen video added mid-call on the polite side
+    await waitFor(() => b.tracks.includes("anon-1") && a.pc.signalingState === "stable" && b.pc.signalingState === "stable", 2000, "renegotiated");
+    expect(Date.now() - t).toBeLessThan(1000);
+    const offersFromA = net.log.filter((m) => m.from === "a" && m.data.kind === "description" && m.data.description.type === "offer");
+    expect(offersFromA.length).toBe(1);
+    expect(a.errors.concat(b.errors)).toEqual([]);
+    expect(a.resets.concat(b.resets)).toEqual([]);
+  });
+
+  it("converges when both sides add tracks at the same time (glare on renegotiation)", async () => {
+    for (let seed = 1; seed <= 15; seed++) {
+      const rnd = mulberry32(seed * 7);
+      const net = new FakeNetwork(() => Math.floor(rnd() * 6));
+      const a = makeSlowPoliteSide(net, "a", "b");
+      const b = makeSlowPoliteSide(net, "b", "a");
+      await waitFor(() => settled(a, b), 3000, `initial (seed ${seed})`);
+      a.pc.addTransceiver();
+      b.pc.addTransceiver();
+      await waitFor(
+        () => a.tracks.includes("anon-1") && b.tracks.includes("anon-1") && a.pc.signalingState === "stable" && b.pc.signalingState === "stable",
+        3000,
+        `glare renegotiation (seed ${seed})`,
+      );
+      expect(a.errors.concat(b.errors), `seed ${seed}`).toEqual([]);
+      expect(a.resets.concat(b.resets), `seed ${seed}`).toEqual([]);
+      a.peer.close();
+      b.peer.close();
+    }
+  });
+
+  it("applies localSdpTransform via createOffer/createAnswer and reports stable", async () => {
+    const net = new FakeNetwork(() => 1);
+    let munging = false;
+    const stableA: number[] = [];
+    const transform = () => (munging ? (sdp: string) => sdp + "a=x-munged:1\r\n" : null);
+    const a = makeSlowPoliteSide(net, "a", "b", { localSdpTransform: transform, onNegotiated: () => stableA.push(Date.now()) });
+    const b = makeSlowPoliteSide(net, "b", "a", { localSdpTransform: transform });
+    await waitFor(() => settled(a, b), 2000, "initial");
+    expect(a.pc.currentLocalDescription?.sdp).not.toContain("x-munged");
+    munging = true;
+    const before = stableA.length;
+    b.pc.addTransceiver();
+    await waitFor(() => a.tracks.includes("anon-1") && a.pc.signalingState === "stable" && b.pc.signalingState === "stable", 2000, "munged renegotiation");
+    // Both the offer (b) and the answer (a) were set locally with the transform.
+    expect(b.pc.currentLocalDescription?.sdp).toContain("a=x-munged:1");
+    expect(a.pc.currentLocalDescription?.sdp).toContain("a=x-munged:1");
+    expect(stableA.length).toBeGreaterThan(before);
+    expect(a.errors.concat(b.errors)).toEqual([]);
+  });
+});

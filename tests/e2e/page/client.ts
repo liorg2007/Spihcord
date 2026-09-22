@@ -3,7 +3,7 @@
  * pong, voice.join/leave, rtc.signal relay) driving the real call engine.
  * The Electron main process drives it through `window.harness`.
  */
-import { createVoiceCall, type PeerInfo, type VoiceCall } from "@shpihcord/call-engine";
+import { createVoiceCall, type PeerInfo, type ScreenSharePresetId, type VoiceCall } from "@shpihcord/call-engine";
 import {
   PROTOCOL_VERSION,
   ServerMessageSchema,
@@ -25,7 +25,8 @@ let pcSeq = 0;
 /** Debug trail of signaling (sent/received) and pc state changes. */
 const sigLog: string[] = [];
 const ms = () => Math.round(performance.now());
-const sigDesc = (d: SignalData) => (d.kind === "description" ? `desc:${d.description.type}` : d.candidate ? "cand" : "cand:end");
+const sigDesc = (d: SignalData) =>
+  d.kind === "description" ? `desc:${d.description.type}` : d.kind === "stream" ? `stream:${d.action}` : d.candidate ? "cand" : "cand:end";
 
 // Independent level meter per remote user (own AudioContext, analyser only, not played).
 let meterCtx: AudioContext | null = null;
@@ -53,6 +54,8 @@ function readMeter(userId: string): number {
   return peak;
 }
 const allPcs: TrackedPc[] = [];
+/** receiver track id -> msid stream ids seen in its track event */
+const trackStreams = new Map<string, string[]>();
 const sdpSender = new Map<string, string>();
 
 const NativePc = window.RTCPeerConnection;
@@ -63,7 +66,10 @@ class TrackingPc extends NativePc {
     allPcs.push(this);
     this.addEventListener("track", (ev) => {
       const stream = ev.streams[0] ?? new MediaStream([ev.track]);
-      if (ev.track.kind === "audio") meterRemote(this as TrackedPc, stream);
+      trackStreams.set(ev.track.id, ev.streams.map((s) => s.id));
+      // Only the mic (first transceiver) feeds the voice meter; screen audio is measured separately.
+      const isMic = this.getTransceivers()[0] === ev.transceiver;
+      if (ev.track.kind === "audio" && isMic) meterRemote(this as TrackedPc, stream);
     });
     this.addEventListener("signalingstatechange", () => sigLog.push(`${ms()} pc${this.__id}(${(this as TrackedPc).__remoteUser ?? "?"}) signaling=${this.signalingState}`));
     this.addEventListener("connectionstatechange", () => sigLog.push(`${ms()} pc${this.__id}(${(this as TrackedPc).__remoteUser ?? "?"}) conn=${this.connectionState}`));
@@ -213,6 +219,19 @@ async function init(opts: { hubUrl: string; username: string; password: string; 
   call.on("peerRemoved", (p) => log("peerRemoved", { userId: p.userId }));
   call.on("speaking", (s) => log("speaking", { userId: s.userId, speaking: s.speaking }));
   call.on("error", (e) => log("error", { message: e.message, cause: String(e.cause ?? "") }));
+  call.on("remoteScreen", ({ userId, stream }) => {
+    remoteScreens.set(userId, stream);
+    const v = stream?.getVideoTracks()[0];
+    log("remoteScreen", {
+      userId,
+      stream: !!stream,
+      tracks: stream ? stream.getTracks().map((t) => `${t.kind}:${t.readyState}:${t.muted ? "muted" : "live"}`).join(",") : "",
+      videoTrackId: v?.id ?? null,
+    });
+  });
+  call.on("viewers", ({ userIds }) => log("viewers", { userIds }));
+  call.on("streamStats", (st) => log("streamStats", { ...st }));
+  call.on("localScreenEnded", () => log("localScreenEnded"));
   let maxLocal = 0;
   call.on("localLevel", ({ level }) => {
     if (level > maxLocal) maxLocal = level;
@@ -262,8 +281,10 @@ async function inbound(): Promise<Record<string, Inbound>> {
     } catch {
       continue;
     }
+    const micMid = pc.getTransceivers()[0]?.mid;
     report.forEach((s: any) => {
-      if (s.type === "inbound-rtp" && (s.kind ?? s.mediaType) === "audio") {
+      // Mic only (first transceiver); screen-share audio has its own m-line.
+      if (s.type === "inbound-rtp" && (s.kind ?? s.mediaType) === "audio" && (s.mid === undefined || s.mid === micMid)) {
         out[pc.__remoteUser!] = {
           bytesReceived: s.bytesReceived ?? 0,
           packetsReceived: s.packetsReceived ?? 0,
@@ -398,5 +419,331 @@ async function glareRepro(pairs: number, delayMs: number, timeoutMs = 6000) {
   return { pairs, delayMs, connected: ok, stuck: results.filter((r) => !r.polite.startsWith("connected")) };
 }
 
-(window as any).harness = { glareRepro, debugPcs, init, join, leave, setMuted, peers, inbound, sampleAudio, takeEvents, state };
+
+// ---------------------------------------------------------------------------
+// Screen share
+
+const remoteScreens = new Map<string, MediaStream | null>();
+let fake: { stream: MediaStream; stop(): void } | null = null;
+
+/**
+ * Fake screen: a 1920x1080 canvas redrawn at 60 fps (moving shapes, scrolling
+ * text, frame counter) via captureStream(60), plus a stereo tone
+ * (L = 1000 Hz, R = 1500 Hz) from OscillatorNodes -> MediaStreamAudioDestination.
+ */
+function makeFakeScreen(opts: { width?: number; height?: number; fps?: number; audio?: boolean; leftHz?: number; rightHz?: number } = {}) {
+  const width = opts.width ?? 1920;
+  const height = opts.height ?? 1080;
+  const fps = opts.fps ?? 60;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const g = canvas.getContext("2d")!;
+  let frame = 0;
+  const draw = () => {
+    frame++;
+    const t = frame / fps;
+    g.fillStyle = `hsl(${(frame * 2) % 360} 40% 18%)`;
+    g.fillRect(0, 0, width, height);
+    g.strokeStyle = "#445";
+    g.lineWidth = 1;
+    for (let x = (frame * 4) % 80; x < width; x += 80) {
+      g.beginPath();
+      g.moveTo(x, 0);
+      g.lineTo(x, height);
+      g.stroke();
+    }
+    for (let i = 0; i < 6; i++) {
+      const x = ((Math.sin(t * (1 + i * 0.3)) + 1) / 2) * (width - 200);
+      const y = ((Math.cos(t * (0.7 + i * 0.2)) + 1) / 2) * (height - 200);
+      g.fillStyle = `hsl(${i * 60} 80% 55%)`;
+      g.fillRect(x, y, 200, 200);
+    }
+    g.fillStyle = "#fff";
+    g.font = "28px monospace";
+    for (let line = 0; line < 12; line++) {
+      g.fillText(`frame ${frame} line ${line} const x = compute(${(frame + line) % 997}); // shpihcord screen share e2e`, 40, 60 + line * 40 - ((frame * 2) % 40));
+    }
+    g.font = "bold 96px sans-serif";
+    g.fillText(String(frame), width - 400, height - 80);
+  };
+  // captureStream(0) + requestFrame() after every draw: in a hidden window the
+  // automatic capture (captureStream(fps)) only yields ~38 fps.
+  const stream = canvas.captureStream(0);
+  const vtrack = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
+  const tick = () => {
+    draw();
+    vtrack.requestFrame?.();
+  };
+  tick();
+  const timer = setInterval(tick, 1000 / fps);
+  (window as any).__drawCount = () => frame;
+  let ctx: AudioContext | null = null;
+  if (opts.audio !== false) {
+    ctx = new AudioContext({ sampleRate: 48000 });
+    void ctx.resume();
+    const merger = ctx.createChannelMerger(2);
+    const dst = ctx.createMediaStreamDestination();
+    dst.channelCount = 2;
+    for (const [hz, ch] of [
+      [opts.leftHz ?? 1000, 0],
+      [opts.rightHz ?? 1500, 1],
+    ] as const) {
+      const osc = ctx.createOscillator();
+      osc.frequency.value = hz;
+      const gain = ctx.createGain();
+      gain.gain.value = 0.5;
+      osc.connect(gain).connect(merger, 0, ch);
+      osc.start();
+    }
+    merger.connect(dst);
+    stream.addTrack(dst.stream.getAudioTracks()[0]);
+  }
+  return {
+    stream,
+    stop() {
+      clearInterval(timer);
+      void ctx?.close();
+    },
+  };
+}
+
+async function startShare(preset: ScreenSharePresetId, opts: { audio?: boolean } = {}) {
+  const prev = fake;
+  fake = makeFakeScreen(opts);
+  await call!.startScreenShare(fake.stream, preset);
+  prev?.stop();
+  const v = fake.stream.getVideoTracks()[0];
+  return { settings: v.getSettings(), contentHint: v.contentHint, tracks: fake.stream.getTracks().map((t) => t.kind) };
+}
+
+function stopShare() {
+  call!.stopScreenShare();
+  fake?.stop();
+  fake = null;
+}
+
+/** Simulate the OS ending the capture (e.g. "Stop sharing" bar): fire 'ended' on the video track. */
+function endShareExternally() {
+  const v = fake?.stream.getVideoTracks()[0];
+  v?.dispatchEvent(new Event("ended"));
+  fake?.stop();
+  fake = null;
+}
+
+async function setPreset(preset: ScreenSharePresetId) {
+  await call!.setScreenSharePreset(preset);
+  return fake?.stream.getVideoTracks()[0]?.getSettings() ?? null;
+}
+
+function watch(userId: string, watching: boolean) {
+  call!.watchStream(userId, watching);
+}
+
+function setStreamVolume(userId: string, v: number) {
+  call!.setStreamVolume(userId, v);
+}
+
+function livePcFor(userId: string): TrackedPc | undefined {
+  return allPcs.filter((pc) => pc.__remoteUser === userId && pc.connectionState !== "closed" && pc.signalingState !== "closed").pop();
+}
+
+function codecOf(report: RTCStatsReport, s: any): string | undefined {
+  const c = s.codecId ? (report.get(s.codecId) as any) : undefined;
+  return c ? `${c.mimeType}${c.sdpFmtpLine ? " " + c.sdpFmtpLine : ""}` : undefined;
+}
+
+/** Video/screen-audio RTP stats with remote user attribution. */
+async function mediaStats() {
+  const out: Record<string, any> = {};
+  for (const pc of allPcs) {
+    if (pc.connectionState === "closed" || pc.signalingState === "closed" || !pc.__remoteUser) continue;
+    const report = await pc.getStats();
+    const tr = pc.getTransceivers();
+    const micMid = tr[0]?.mid;
+    const row: any = { videoIn: null, videoOut: null, screenAudioOut: null, screenAudioIn: null, transceivers: tr.map((t) => `${t.mid}:${t.receiver.track.kind}:${t.direction}/${t.currentDirection}`).join(" ") };
+    report.forEach((s: any) => {
+      const kind = s.kind ?? s.mediaType;
+      if (s.type === "inbound-rtp" && kind === "video") {
+        row.videoIn = { bytes: s.bytesReceived, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, framesDecoded: s.framesDecoded, codec: codecOf(report, s), decoder: s.decoderImplementation, ts: s.timestamp };
+      } else if (s.type === "outbound-rtp" && kind === "video") {
+        row.videoOut = { bytes: s.bytesSent, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, framesSent: s.framesSent, codec: codecOf(report, s), encoder: s.encoderImplementation, powerEfficient: s.powerEfficientEncoder, qlr: s.qualityLimitationReason, target: s.targetBitrate, ts: s.timestamp };
+      } else if (s.type === "media-source" && kind === "video") {
+        row.videoSource = { w: s.width, h: s.height, fps: s.framesPerSecond, frames: s.frames };
+      } else if (s.type === "outbound-rtp" && kind === "audio" && s.mid !== micMid) {
+        row.screenAudioOut = { bytes: s.bytesSent, codec: codecOf(report, s), target: s.targetBitrate, ts: s.timestamp, mid: s.mid };
+      } else if (s.type === "inbound-rtp" && kind === "audio" && s.mid !== micMid) {
+        row.screenAudioIn = { bytes: s.bytesReceived, codec: codecOf(report, s), ts: s.timestamp, mid: s.mid };
+      }
+    });
+    const vs = tr.find((t, i) => i > 0 && t.sender.track?.kind === "video");
+    if (vs) {
+      const p = vs.sender.getParameters() as any;
+      row.videoSenderParams = { enc: p.encodings?.[0], degradationPreference: p.degradationPreference };
+    }
+    out[pc.__remoteUser] = row;
+  }
+  return out;
+}
+
+function dominantHz(analyser: AnalyserNode, buf: Float32Array<ArrayBuffer>): { hz: number; db: number } {
+  analyser.getFloatFrequencyData(buf);
+  let best = 0;
+  for (let i = 1; i < buf.length; i++) if (buf[i] > buf[best]) best = i;
+  return { hz: Math.round((best * analyser.context.sampleRate) / analyser.fftSize), db: Math.round(buf[best]) };
+}
+
+/**
+ * Analyse what we receive from `userId` for `ms`: the screen-audio track (split
+ * L/R, dominant frequency) vs the mic track, plus the engine's own screen-audio
+ * level (after the per-stream volume) and speaking events for that user.
+ */
+async function analyseScreenAudio(userId: string, durationMs: number) {
+  const pc = livePcFor(userId);
+  if (!pc) return { error: "no pc" };
+  const tr = pc.getTransceivers();
+  const mic = tr[0]?.receiver.track;
+  const screenT = tr.find((t, i) => i > 0 && t.receiver.track.kind === "audio" && (t.currentDirection === "recvonly" || t.currentDirection === "sendrecv"));
+  const video = tr.find((t, i) => i > 0 && t.receiver.track.kind === "video" && (t.currentDirection === "recvonly" || t.currentDirection === "sendrecv"));
+  if (!screenT) return { error: "no screen audio transceiver", transceivers: tr.map((t) => `${t.mid}:${t.receiver.track.kind}:${t.currentDirection}`) };
+  const ctx = new AudioContext({ sampleRate: 48000 });
+  await ctx.resume();
+  const mk = () => {
+    const a = ctx.createAnalyser();
+    a.fftSize = 4096;
+    a.smoothingTimeConstant = 0.5;
+    return a;
+  };
+  const src = ctx.createMediaStreamSource(new MediaStream([screenT.receiver.track]));
+  const split = ctx.createChannelSplitter(2);
+  const aL = mk();
+  const aR = mk();
+  src.connect(split);
+  split.connect(aL, 0);
+  split.connect(aR, 1);
+  const micSrc = ctx.createMediaStreamSource(new MediaStream([mic]));
+  const aM = mk();
+  micSrc.connect(aM);
+  const buf = new Float32Array(aL.frequencyBinCount);
+  const tbuf = new Float32Array(aL.fftSize);
+  const rmsOf = (a: AnalyserNode) => {
+    a.getFloatTimeDomainData(tbuf);
+    let s = 0;
+    for (const v of tbuf) s += v * v;
+    return Math.sqrt(s / tbuf.length);
+  };
+  const L: number[] = [];
+  const R: number[] = [];
+  const M: number[] = [];
+  const rmsL: number[] = [];
+  const rmsR: number[] = [];
+  let engineMax = 0;
+  let speakingOn = 0;
+  const off = call!.on("speaking", (s) => {
+    if (s.userId === userId && s.speaking) speakingOn++;
+  });
+  const audio = (call as any).audio;
+  const end = performance.now() + durationMs;
+  while (performance.now() < end) {
+    await new Promise((r) => setTimeout(r, 100));
+    L.push(dominantHz(aL, buf).hz);
+    R.push(dominantHz(aR, buf).hz);
+    const m = dominantHz(aM, buf);
+    if (m.db > -70) M.push(m.hz);
+    rmsL.push(rmsOf(aL));
+    rmsR.push(rmsOf(aR));
+    engineMax = Math.max(engineMax, audio?.readStreamLevel?.(userId) ?? -1);
+  }
+  off();
+  void ctx.close();
+  const mode = (xs: number[]) => {
+    const c = new Map<number, number>();
+    for (const x of xs) c.set(x, (c.get(x) ?? 0) + 1);
+    return [...c].sort((a, b) => b[1] - a[1])[0]?.[0] ?? -1;
+  };
+  const avg = (xs: number[]) => Math.round((xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length)) * 1000) / 1000;
+  const vidStreams = video ? trackStreams.get(video.receiver.track.id) ?? [] : [];
+  const scrStreams = trackStreams.get(screenT.receiver.track.id) ?? [];
+  const micStreams = trackStreams.get(mic.id) ?? [];
+  return {
+    leftHz: mode(L),
+    rightHz: mode(R),
+    micHz: mode(M),
+    rmsL: avg(rmsL),
+    rmsR: avg(rmsR),
+    engineStreamLevelMax: Math.round(engineMax * 1000) / 1000,
+    speakingOn,
+    msid: { screenAudio: scrStreams, screenVideo: vidStreams, mic: micStreams },
+    screenAudioSameMsidAsVideo: scrStreams.length > 0 && scrStreams[0] === vidStreams[0],
+    micMsidDiffers: micStreams[0] !== scrStreams[0],
+    screenTrackMuted: screenT.receiver.track.muted,
+  };
+}
+
+/** Attach the latest remoteScreen stream to a <video muted> and report what it renders. */
+async function probeRemoteVideo(userId: string, ms = 1500) {
+  const stream = remoteScreens.get(userId);
+  if (!stream) return { stream: false };
+  const el = document.createElement("video");
+  el.muted = true;
+  el.autoplay = true;
+  el.playsInline = true;
+  el.srcObject = stream;
+  document.body.appendChild(el);
+  await el.play().catch(() => undefined);
+  const q0 = el.getVideoPlaybackQuality?.();
+  const t0 = performance.now();
+  await new Promise((r) => setTimeout(r, ms));
+  const q1 = el.getVideoPlaybackQuality?.();
+  const res = {
+    stream: true,
+    videoWidth: el.videoWidth,
+    videoHeight: el.videoHeight,
+    trackState: stream.getVideoTracks()[0]?.readyState,
+    renderedFps: q0 && q1 ? Math.round(((q1.totalVideoFrames - q0.totalVideoFrames) * 1000) / (performance.now() - t0)) : null,
+    audioTracksInStream: stream.getAudioTracks().length,
+  };
+  el.srcObject = null;
+  el.remove();
+  return res;
+}
+
+function screenState() {
+  return { sharing: call?.isScreenSharing() ?? false, remote: [...remoteScreens].map(([u, s]) => [u, !!s]) };
+}
+
+/** Test hook: recreate our RTCPeerConnection to `userId` as if it had failed (engine internals). */
+function forceReset(userId: string) {
+  (call as any).resetPeer(userId, "failed", []);
+}
+
+function setDeafened(d: boolean) {
+  call?.setDeafened(d);
+}
+
+(window as any).harness = {
+  glareRepro,
+  debugPcs,
+  init,
+  join,
+  leave,
+  setMuted,
+  setDeafened,
+  peers,
+  inbound,
+  sampleAudio,
+  takeEvents,
+  state,
+  startShare,
+  stopShare,
+  endShareExternally,
+  setPreset,
+  watch,
+  setStreamVolume,
+  mediaStats,
+  analyseScreenAudio,
+  probeRemoteVideo,
+  screenState,
+  forceReset,
+};
 (window as any).harnessLoaded = true;

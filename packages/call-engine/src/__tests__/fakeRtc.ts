@@ -33,6 +33,7 @@ export class FakePC {
   onicecandidate: ((ev: { candidate: unknown }) => void) | null = null;
   ontrack: ((ev: { track: unknown; streams: unknown[] }) => void) | null = null;
   onconnectionstatechange: (() => void) | null = null;
+  onsignalingstatechange: (() => void) | null = null;
 
   readonly fingerprint = `sha-256 AA:${++fpCounter}`;
   readonly addedCandidates: unknown[] = [];
@@ -90,6 +91,17 @@ export class FakePC {
     this.closed = true;
     this.signalingState = "closed";
     this.connectionState = "closed";
+  }
+
+  createOffer(): Promise<Desc> {
+    return this.enqueue(() => ({ type: "offer" as RTCSdpType, sdp: this.makeSdp(true) }));
+  }
+
+  createAnswer(): Promise<Desc> {
+    return this.enqueue(() => {
+      if (this.signalingState !== "have-remote-offer") throw invalidState(`createAnswer in ${this.signalingState}`);
+      return { type: "answer" as RTCSdpType, sdp: this.makeSdp(false) };
+    });
   }
 
   setLocalDescription(desc?: Desc): Promise<void> {
@@ -158,12 +170,12 @@ export class FakePC {
 
   // --- internals -------------------------------------------------------------
 
-  private enqueue(fn: () => void): Promise<void> {
+  private enqueue<T>(fn: () => T): Promise<T> {
     this.pendingOps++;
     const run = this.chain.then(async () => {
       await delay(this.opDelay());
       if (this.closed) throw invalidState("closed");
-      fn();
+      return fn();
     });
     const done = run.finally(() => {
       this.pendingOps--;
@@ -195,6 +207,7 @@ export class FakePC {
 
   private becameStable(): void {
     this.signalingState = "stable";
+    this.onsignalingstatechange?.();
     this.negFlag = false;
     if (this.currentLocalDescription && this.currentRemoteDescription && this.connectionState !== "connected") {
       setTimeout(() => {

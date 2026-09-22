@@ -1,20 +1,35 @@
 /**
- * VoiceCall implementation: full-mesh WebRTC audio (browser only).
+ * VoiceCall implementation: full-mesh WebRTC audio + opt-in screen share (browser only).
+ *
+ * Screen share, per peer connection:
+ *  - the mic is always the first transceiver (created in the Peer constructor);
+ *    on the receiving side the remote mic always lands on transceiver[0] too, so
+ *    any other audio transceiver that receives is screen-share audio;
+ *  - the sharer adds its screen video (+ optional audio) with addTransceiver
+ *    (sendonly, own msid stream) only for peers that sent `watch`; `unwatch`
+ *    sets them to inactive (replaceTrack(null) first) and a later watch reuses
+ *    the same transceivers, so m-lines don't pile up.
  */
 import type { IceServer, SignalData } from "@shpihcord/protocol";
 import type {
   InputMode,
   PeerInfo,
+  ScreenSharePreset,
+  ScreenSharePresetId,
   VoiceCall,
   VoiceCallEvents,
   VoiceCallOptions,
 } from "./types";
+import { SCREEN_SHARE_PRESETS } from "./presets";
 import { Emitter } from "./emitter";
 import { AudioEngine, type MicSettings } from "./audio";
 import { Peer, type ResetReason } from "./peer";
 import { SignalBuffer, diffPeers, isPolite } from "./mesh";
-import { parseStatsReport, type LossCounters } from "./stats";
+import { parseStatsReport, parseVideoStats, type LossCounters, type VideoCounters } from "./stats";
 import { DEFAULT_VAD_THRESHOLD, VadGate, clamp01 } from "./vad";
+import { mungeLocalSdp, mungeOutgoingSdp } from "./sdp";
+import { CpuWatch, ScreenShareIntents, isStreamSignal, screenEncoding, type StreamAction } from "./screenShare";
+import { codecName, h264Rank, mediaCapabilitiesContentType, orderVideoCodecs, SCREEN_CODEC_ORDER, type CodecLike } from "./codecs";
 
 const TICK_MS = 25; // local VAD
 const LEVEL_EVERY_TICKS = 2; // ~20 Hz localLevel
@@ -23,6 +38,27 @@ const STATS_INTERVAL_MS = 2000;
 const REMOTE_SPEAKING_THRESHOLD = 0.2; // ~ -48 dBFS; remote senders gate to silence
 const REMOTE_SPEAKING_HANGOVER_MS = 400;
 const SENDER_MAX_BITRATE = 64_000;
+const SCREEN_AUDIO_MAX_BITRATE = 128_000;
+/** Emit remoteScreen even if the video track never reports 'unmute' (UI shows a loading tile). */
+const REMOTE_SCREEN_UNMUTE_FALLBACK_MS = 2_000;
+
+/** Our outgoing screen share on one peer connection. */
+interface ScreenSend {
+  video: RTCRtpTransceiver;
+  audio?: RTCRtpTransceiver;
+  attached: boolean;
+  videoTrack: MediaStreamTrack | null;
+  audioTrack: MediaStreamTrack | null;
+  cpu: CpuWatch;
+  chain: Promise<void>;
+}
+
+/** A remote screen share we are receiving on one peer connection. */
+interface RemoteScreen {
+  track: MediaStreamTrack;
+  stream: MediaStream | null;
+  dispose(): void;
+}
 
 interface PeerEntry {
   peer: Peer;
@@ -31,7 +67,19 @@ interface PeerEntry {
   statsInFlight: boolean;
   speaking: boolean;
   remoteVad: VadGate;
+  screenSend?: ScreenSend;
+  remoteScreen?: RemoteScreen;
+  videoCounters?: VideoCounters;
 }
+
+interface LocalShare {
+  stream: MediaStream;
+  video: MediaStreamTrack;
+  audio: MediaStreamTrack | null;
+  preset: ScreenSharePreset;
+}
+
+type AnyParams = RTCRtpSendParameters;
 
 type Timer = ReturnType<typeof setInterval>;
 
@@ -60,6 +108,16 @@ export class VoiceCallImpl implements VoiceCall {
   private statsTimer: Timer | undefined;
   private tickCount = 0;
   private readonly cleanups: Array<() => void> = [];
+
+  // screen share
+  private readonly intents = new ScreenShareIntents();
+  private share: LocalShare | null = null;
+  private shareGen = 0;
+  private screenMsid: MediaStream | null = null;
+  private readonly streamVolumes = new Map<string, number>();
+  private lastViewers = "";
+  private codecPrefs: Promise<{ recv: CodecLike[] | null; send: CodecLike[] | null }> | undefined;
+  private codecPrefsResolved: { recv: CodecLike[] | null; send: CodecLike[] | null } | undefined;
 
   constructor(private readonly options: VoiceCallOptions) {
     this.selfId = options.selfId;
@@ -188,6 +246,89 @@ export class VoiceCallImpl implements VoiceCall {
     return this.emitter.on(event, handler);
   }
 
+  // ---------------------------------------------------------------------------
+  // Screen share (public)
+
+  async startScreenShare(stream: MediaStream, presetId: ScreenSharePresetId): Promise<void> {
+    if (this.closed) throw new Error("Voice call is closed");
+    const preset = SCREEN_SHARE_PRESETS[presetId];
+    if (!preset) throw new Error(`Unknown screen share preset: ${presetId}`);
+    const video = stream.getVideoTracks()[0];
+    if (!video) throw new Error("Screen share stream has no video track");
+    const audio = stream.getAudioTracks()[0] ?? null;
+    const gen = ++this.shareGen;
+
+    await applyVideoPreset(video, preset);
+    await this.ensureCodecPrefs();
+    if (this.closed || gen !== this.shareGen) {
+      // Closed or superseded by a newer start/stop while we were awaiting.
+      if (this.share?.stream !== stream) stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+
+    const old = this.share;
+    this.share = { stream, video, audio, preset };
+    this.intents.setSharing(true);
+    video.onended = () => this.onLocalScreenEnded(stream);
+    if (audio) {
+      audio.onended = () => console.warn("[call-engine] screen share audio track ended");
+    }
+    if (old && old.stream !== stream) {
+      old.video.onended = null;
+      if (old.audio) old.audio.onended = null;
+      for (const t of [...old.stream.getTracks(), old.video, ...(old.audio ? [old.audio] : [])]) {
+        if (t !== video && t !== audio) t.stop();
+      }
+    }
+    for (const e of this.peers.values()) e.screenSend?.cpu.reset();
+    // Replacement keeps existing viewers: attach() uses replaceTrack on their transceivers.
+    this.reconcileScreen(true);
+  }
+
+  async setScreenSharePreset(presetId: ScreenSharePresetId): Promise<void> {
+    const preset = SCREEN_SHARE_PRESETS[presetId];
+    if (!preset) throw new Error(`Unknown screen share preset: ${presetId}`);
+    const share = this.share;
+    if (!share || this.closed) return;
+    share.preset = preset;
+    for (const e of this.peers.values()) {
+      e.screenSend?.cpu.reset();
+      this.tuneScreen(e);
+    }
+    await applyVideoPreset(share.video, preset);
+    for (const e of this.peers.values()) this.tuneScreen(e);
+  }
+
+  stopScreenShare(): void {
+    this.shareGen++;
+    const share = this.share;
+    if (!share) return;
+    this.share = null;
+    this.intents.setSharing(false);
+    share.video.onended = null;
+    if (share.audio) share.audio.onended = null;
+    for (const t of [...share.stream.getTracks(), share.video, ...(share.audio ? [share.audio] : [])]) t.stop();
+    if (!this.closed) this.reconcileScreen(false);
+  }
+
+  isScreenSharing(): boolean {
+    return !!this.share;
+  }
+
+  watchStream(userId: string, watching: boolean): void {
+    if (this.closed || !userId || userId === this.selfId) return;
+    const signal = this.intents.watch(userId, watching);
+    // Without a connection yet, the intent is sent when the peer is created.
+    if (this.peers.has(userId)) this.send(userId, signal);
+    this.refreshRemoteScreen(userId);
+  }
+
+  setStreamVolume(userId: string, volume: number): void {
+    const v = Number.isFinite(volume) ? Math.min(2, Math.max(0, volume)) : 1;
+    this.streamVolumes.set(userId, v);
+    if (!this.closed) this.audio.setStreamGain(userId, v);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -201,9 +342,19 @@ export class VoiceCallImpl implements VoiceCall {
         /* ignore */
       }
     }
-    for (const e of this.peers.values()) e.peer.close();
+    for (const e of this.peers.values()) {
+      e.remoteScreen?.dispose();
+      e.peer.close();
+    }
     this.peers.clear();
     this.buffer.clear();
+    if (this.share) {
+      this.share.video.onended = null;
+      this.share.stream.getTracks().forEach((t) => t.stop());
+      this.share.audio?.stop();
+      this.share = null;
+    }
+    this.intents.clear();
     this.audio.close();
     this.emitter.clear();
   }
@@ -247,9 +398,26 @@ export class VoiceCallImpl implements VoiceCall {
         localStreams: [this.audio.localStream],
         senderTuning: { maxBitrate: SENDER_MAX_BITRATE, priority: "high" },
         send: (data) => this.send(userId, data),
-        onTrack: (track, stream) => {
-          if (!isCurrent() || track.kind !== "audio") return;
-          this.audio.addRemote(userId, stream ?? new MediaStream([track]), this.effectiveGain(userId));
+        mungeSdp: (sdp) => mungeOutgoingSdp(sdp, peer ? micMid(peer.pc) : null),
+        localSdpTransform: () => {
+          if (!peer || !hasScreenAudioTransceiver(peer.pc)) return null;
+          const mid = micMid(peer.pc);
+          return (sdp) => mungeLocalSdp(sdp, mid);
+        },
+        onTrack: (track, stream, transceiver) => {
+          if (!isCurrent()) return;
+          const isMic = !transceiver || peer!.pc.getTransceivers()[0] === transceiver;
+          if (track.kind === "audio" && isMic) {
+            this.audio.addRemote(userId, stream ?? new MediaStream([track]), this.effectiveGain(userId));
+          } else {
+            this.refreshRemoteScreen(userId);
+          }
+        },
+        onNegotiated: () => {
+          if (!isCurrent()) return;
+          this.refreshRemoteScreen(userId);
+          const e = this.peers.get(userId);
+          if (e) this.tuneScreen(e);
         },
         onConnectionState: (state) => {
           if (isCurrent()) this.updateInfo(userId, { connectionState: state });
@@ -280,13 +448,19 @@ export class VoiceCallImpl implements VoiceCall {
     };
     this.peers.set(userId, entry);
     this.emitter.emit("peer", { ...entry.info });
-    for (const data of replay) void peer.handleSignal(data);
+    if (this.share && this.intents.shouldSendTo(userId)) this.attachScreen(entry);
+    for (const signal of this.intents.signalsForNewPeer(userId)) this.send(userId, signal);
+    for (const data of replay) {
+      if (isStreamSignal(data)) this.onStreamSignal(userId, data.action);
+      else void peer.handleSignal(data);
+    }
   }
 
   private disposePeer(userId: string): PeerEntry | undefined {
     const e = this.peers.get(userId);
     if (!e) return undefined;
     this.peers.delete(userId);
+    this.clearRemoteScreen(e, userId);
     e.peer.close();
     this.audio.removeRemote(userId);
     if (e.speaking) this.emitter.emit("speaking", { userId, speaking: false });
@@ -294,9 +468,11 @@ export class VoiceCallImpl implements VoiceCall {
   }
 
   private removePeer(userId: string): void {
+    this.intents.peerLeft(userId);
     if (!this.disposePeer(userId)) return;
     this.buffer.drop(userId);
     this.emitter.emit("peerRemoved", { userId });
+    this.emitViewers();
   }
 
   private resetPeer(userId: string, reason: ResetReason, replay: SignalData[]): void {
@@ -306,6 +482,7 @@ export class VoiceCallImpl implements VoiceCall {
     }
     this.disposePeer(userId);
     this.createPeer(userId, replay);
+    this.emitViewers();
   }
 
   private send(to: string, data: SignalData): void {
@@ -320,8 +497,9 @@ export class VoiceCallImpl implements VoiceCall {
   private onSignal(from: string, data: SignalData): void {
     if (this.closed || from === this.selfId) return;
     const e = this.peers.get(from);
-    if (e) void e.peer.handleSignal(data);
-    else this.buffer.push(from, data, Date.now());
+    if (!e) this.buffer.push(from, data, Date.now());
+    else if (isStreamSignal(data)) this.onStreamSignal(from, data.action);
+    else void e.peer.handleSignal(data);
   }
 
   private effectiveGain(userId: string): number {
@@ -362,6 +540,7 @@ export class VoiceCallImpl implements VoiceCall {
             rttMs: parsed.rttMs ?? e.info.rttMs,
             lossPct: parsed.lossPct ?? e.info.lossPct,
           });
+          this.handleVideoStats(userId, e, report);
         })
         .catch(() => {
           /* stats are best effort */
@@ -370,6 +549,272 @@ export class VoiceCallImpl implements VoiceCall {
           e.statsInFlight = false;
         });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Screen share (internals)
+
+  private onStreamSignal(from: string, action: StreamAction): void {
+    this.intents.onRemoteSignal(from, action);
+    this.reconcileScreen(false);
+  }
+
+  /** Attach/detach our share per peer to match intents; `replace` re-attaches current viewers (new share). */
+  private reconcileScreen(replace: boolean): void {
+    if (this.closed) return;
+    for (const [userId, e] of this.peers) {
+      const want = !!this.share && this.intents.shouldSendTo(userId);
+      const s = e.screenSend;
+      if (want && (!s?.attached || replace || s.videoTrack !== this.share!.video)) this.attachScreen(e);
+      else if (!want && s?.attached) this.detachScreen(e);
+    }
+    this.emitViewers();
+  }
+
+  private screenMsidStream(): MediaStream {
+    this.screenMsid ??= new MediaStream();
+    return this.screenMsid;
+  }
+
+  private attachScreen(e: PeerEntry): void {
+    const share = this.share;
+    if (!share || e.peer.isClosed) return;
+    const pc = e.peer.pc;
+    const msid = this.screenMsidStream();
+    try {
+      let s = e.screenSend;
+      if (!s) {
+        const enc = screenEncoding(share.preset);
+        const video = pc.addTransceiver(share.video, {
+          direction: "sendonly",
+          streams: [msid],
+          sendEncodings: [
+            {
+              maxBitrate: enc.maxBitrate,
+              maxFramerate: enc.maxFramerate,
+              scaleResolutionDownBy: enc.scaleResolutionDownBy,
+              priority: "high",
+              networkPriority: "high",
+            },
+          ],
+        });
+        this.applyCodecPreferences(video);
+        s = { video, attached: true, videoTrack: share.video, audioTrack: null, cpu: new CpuWatch(), chain: Promise.resolve() };
+        e.screenSend = s;
+      } else {
+        if (s.videoTrack !== share.video || !s.attached) {
+          void s.video.sender.replaceTrack(share.video).catch((err) => this.emitError("Failed to attach screen video", err));
+        }
+        if (s.video.direction !== "sendonly") s.video.direction = "sendonly";
+        s.videoTrack = share.video;
+      }
+      if (share.audio) {
+        if (!s.audio) {
+          s.audio = pc.addTransceiver(share.audio, {
+            direction: "sendonly",
+            streams: [msid],
+            sendEncodings: [{ maxBitrate: SCREEN_AUDIO_MAX_BITRATE, priority: "high", networkPriority: "high" }],
+          });
+        } else {
+          if (s.audioTrack !== share.audio || !s.attached) {
+            void s.audio.sender.replaceTrack(share.audio).catch((err) => this.emitError("Failed to attach screen audio", err));
+          }
+          if (s.audio.direction !== "sendonly") s.audio.direction = "sendonly";
+        }
+        s.audioTrack = share.audio;
+      } else if (s.audio) {
+        void s.audio.sender.replaceTrack(null).catch(() => undefined);
+        if (s.audio.direction !== "inactive") s.audio.direction = "inactive";
+        s.audioTrack = null;
+      }
+      s.attached = true;
+      this.tuneScreen(e);
+    } catch (err) {
+      this.emitError(`Failed to share screen with ${e.info.userId}`, err);
+    }
+  }
+
+  private detachScreen(e: PeerEntry): void {
+    const s = e.screenSend;
+    if (!s || !s.attached) return;
+    s.attached = false;
+    s.videoTrack = null;
+    s.audioTrack = null;
+    s.cpu.reset();
+    if (e.peer.isClosed) return;
+    try {
+      // replaceTrack(null) stops the encoder immediately; 'inactive' tells the viewer (renegotiation).
+      for (const t of [s.video, s.audio]) {
+        if (!t) continue;
+        void t.sender.replaceTrack(null).catch(() => undefined);
+        if (t.direction !== "inactive") t.direction = "inactive";
+      }
+    } catch (err) {
+      this.emitError(`Failed to stop sharing with ${e.info.userId}`, err);
+    }
+  }
+
+  /** Apply encoding parameters to this peer's screen senders (serialized per peer). */
+  private tuneScreen(e: PeerEntry): void {
+    const s = e.screenSend;
+    if (!s || !s.attached || !this.share || e.peer.isClosed) return;
+    const preset = this.share.preset;
+    s.chain = s.chain
+      .then(async () => {
+        if (!s.attached || e.peer.isClosed) return;
+        const enc = screenEncoding(preset, s.cpu.downgrade);
+        await updateSenderParams(
+          s.video.sender,
+          (p) => {
+            for (const x of p.encodings) {
+              x.active = true;
+              x.maxBitrate = enc.maxBitrate;
+              x.maxFramerate = enc.maxFramerate;
+              x.scaleResolutionDownBy = enc.scaleResolutionDownBy;
+              x.priority = "high";
+              x.networkPriority = "high";
+            }
+          },
+          enc.degradationPreference,
+        );
+        if (s.audio && s.audioTrack) {
+          await updateSenderParams(s.audio.sender, (p) => {
+            for (const x of p.encodings) {
+              x.maxBitrate = SCREEN_AUDIO_MAX_BITRATE;
+              x.priority = "high";
+              x.networkPriority = "high";
+            }
+          });
+        }
+      })
+      .catch((err) => console.warn("[call-engine] screen sender tuning failed", err));
+  }
+
+  private onLocalScreenEnded(stream: MediaStream): void {
+    if (this.closed || this.share?.stream !== stream) return;
+    this.stopScreenShare();
+    this.emitter.emit("localScreenEnded", {});
+  }
+
+  private emitViewers(): void {
+    if (this.closed) return;
+    const ids = [...this.peers].filter(([, e]) => e.screenSend?.attached).map(([id]) => id).sort();
+    const key = ids.join(",");
+    if (key === this.lastViewers) return;
+    this.lastViewers = key;
+    this.emitter.emit("viewers", { userIds: ids });
+  }
+
+  /** Recompute what we receive from `userId` (screen video + audio) from the transceivers. */
+  private refreshRemoteScreen(userId: string): void {
+    const e = this.peers.get(userId);
+    if (!e || this.closed) return;
+    let video: MediaStreamTrack | undefined;
+    let audio: MediaStreamTrack | undefined;
+    if (this.intents.isWatching(userId) && !e.peer.isClosed) {
+      const all = e.peer.pc.getTransceivers();
+      for (let i = 1; i < all.length; i++) {
+        const t = all[i];
+        const dir = t.currentDirection;
+        if (dir !== "recvonly" && dir !== "sendrecv") continue;
+        const track = t.receiver.track;
+        if (track?.kind === "video" && !video) video = track;
+        else if (track?.kind === "audio" && !audio) audio = track;
+      }
+    }
+    if (audio) this.audio.addStreamAudio(userId, audio, this.streamVolumes.get(userId) ?? 1);
+    else this.audio.removeStreamAudio(userId);
+
+    const current = e.remoteScreen;
+    if (current && current.track === video) return;
+    if (current) this.clearRemoteScreen(e, userId, false);
+    if (!video) return;
+
+    const track = video;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const rs: RemoteScreen = {
+      track,
+      stream: null,
+      dispose: () => {
+        track.removeEventListener("unmute", emit);
+        if (timer) clearTimeout(timer);
+      },
+    };
+    const emit = () => {
+      if (e.remoteScreen !== rs || rs.stream || this.closed) return;
+      rs.dispose();
+      rs.stream = new MediaStream([track]);
+      this.emitter.emit("remoteScreen", { userId, stream: rs.stream });
+    };
+    e.remoteScreen = rs;
+    if (!track.muted) {
+      emit();
+    } else {
+      track.addEventListener("unmute", emit);
+      timer = setTimeout(emit, REMOTE_SCREEN_UNMUTE_FALLBACK_MS);
+    }
+  }
+
+  private clearRemoteScreen(e: PeerEntry, userId: string, withAudio = true): void {
+    if (withAudio) this.audio.removeStreamAudio(userId);
+    const rs = e.remoteScreen;
+    if (!rs) return;
+    e.remoteScreen = undefined;
+    e.videoCounters = undefined;
+    rs.dispose();
+    if (rs.stream) this.emitter.emit("remoteScreen", { userId, stream: null });
+  }
+
+  private handleVideoStats(userId: string, e: PeerEntry, report: RTCStatsReport): void {
+    const s = e.screenSend;
+    const sending = !!s?.attached && !!this.share;
+    const receiving = !!e.remoteScreen?.stream;
+    if (!sending && !receiving) {
+      e.videoCounters = undefined;
+      return;
+    }
+    const v = parseVideoStats(report, e.videoCounters);
+    e.videoCounters = v.counters;
+    if (sending && v.send && this.share) {
+      const { bytes: _b, ...rest } = v.send;
+      this.emitter.emit("streamStats", { userId: this.selfId, direction: "send", viewerId: userId, ...rest });
+      const next = s!.cpu.update(v.send.qualityLimitation, this.share.preset, Date.now());
+      if (next) {
+        console.warn(
+          `[call-engine] encoder CPU-limited for >10s sending to ${userId} at preset ${this.share.preset.id}: ` +
+            `maxFramerate x${next.fpsFactor}, scaleResolutionDownBy ${next.scale}`,
+        );
+        this.tuneScreen(e);
+      }
+    }
+    if (receiving && v.recv) {
+      const { bytes: _b, ...rest } = v.recv;
+      this.emitter.emit("streamStats", { userId, direction: "recv", ...rest });
+    }
+  }
+
+  /** Compute (once) the video codec preference order, probing hardware encoders. */
+  private ensureCodecPrefs(): Promise<unknown> {
+    this.codecPrefs ??= computeCodecPrefs().then((r) => {
+      this.codecPrefsResolved = r;
+      return r;
+    });
+    return this.codecPrefs;
+  }
+
+  private applyCodecPreferences(t: RTCRtpTransceiver): void {
+    const prefs = this.codecPrefsResolved;
+    if (!prefs || typeof t.setCodecPreferences !== "function") return;
+    for (const list of [prefs.recv, prefs.send]) {
+      if (!list) continue;
+      try {
+        t.setCodecPreferences(list as RTCRtpCodec[]);
+        return;
+      } catch {
+        /* try the next list */
+      }
+    }
+    console.warn("[call-engine] setCodecPreferences rejected; using the default codec order");
   }
 
   // ---------------------------------------------------------------------------
@@ -426,4 +871,116 @@ export class VoiceCallImpl implements VoiceCall {
     if (this.closed) return;
     this.emitter.emit("error", { message, cause });
   }
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+
+function micMid(pc: RTCPeerConnection): string | null {
+  try {
+    return pc.getTransceivers()[0]?.mid ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function hasScreenAudioTransceiver(pc: RTCPeerConnection): boolean {
+  try {
+    return pc.getTransceivers().some((t, i) => i > 0 && t.receiver.track?.kind === "audio");
+  } catch {
+    return false;
+  }
+}
+
+/** contentHint + applyConstraints (max values only: never upscale). */
+async function applyVideoPreset(track: MediaStreamTrack, preset: ScreenSharePreset): Promise<void> {
+  try {
+    track.contentHint = preset.contentHint;
+  } catch {
+    /* ignore */
+  }
+  try {
+    await track.applyConstraints({
+      width: { max: preset.maxWidth },
+      height: { max: preset.maxHeight },
+      frameRate: { max: preset.frameRate, ideal: preset.frameRate },
+    });
+  } catch (err) {
+    console.warn("[call-engine] screen track applyConstraints failed", err);
+  }
+}
+
+/** getParameters -> mutate -> setParameters; retries without degradationPreference if rejected. */
+async function updateSenderParams(
+  sender: RTCRtpSender,
+  mutate: (p: AnyParams) => void,
+  degradationPreference?: RTCDegradationPreference,
+): Promise<boolean> {
+  for (const withPref of degradationPreference ? [true, false] : [false]) {
+    const p = sender.getParameters() as AnyParams;
+    if (!p.encodings || p.encodings.length === 0) return false; // not negotiated yet; retried later
+    mutate(p);
+    if (withPref) p.degradationPreference = degradationPreference;
+    try {
+      await sender.setParameters(p);
+      return true;
+    } catch (err) {
+      if (!withPref) throw err;
+    }
+  }
+  return false;
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([p, new Promise<undefined>((r) => (timer = setTimeout(() => r(undefined), ms)))]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function computeCodecPrefs(): Promise<{ recv: CodecLike[] | null; send: CodecLike[] | null }> {
+  const recvCaps = (globalThis.RTCRtpReceiver?.getCapabilities?.("video")?.codecs ?? null) as CodecLike[] | null;
+  const sendCaps = (globalThis.RTCRtpSender?.getCapabilities?.("video")?.codecs ?? null) as CodecLike[] | null;
+  if (!recvCaps || !sendCaps) return { recv: null, send: null };
+  const sendable = new Set(sendCaps.map((c) => codecName(c.mimeType)));
+
+  // Hardware encoders: mediaCapabilities.encodingInfo(...).powerEfficient.
+  const hardware = new Set<string>();
+  const mc = (globalThis.navigator as Navigator | undefined)?.mediaCapabilities;
+  if (mc?.encodingInfo) {
+    const best = new Map<string, CodecLike>();
+    for (const c of sendCaps) {
+      const name = codecName(c.mimeType);
+      if (!SCREEN_CODEC_ORDER.includes(name)) continue;
+      const prev = best.get(name);
+      if (!prev || (name === "H264" && h264Rank(c.sdpFmtpLine) < h264Rank(prev.sdpFmtpLine))) best.set(name, c);
+    }
+    await Promise.all(
+      [...best].map(async ([name, c]) => {
+        try {
+          const info = await withTimeout(
+            mc.encodingInfo({
+              type: "webrtc",
+              video: { contentType: mediaCapabilitiesContentType(c), width: 1920, height: 1080, bitrate: 6_000_000, framerate: 60 },
+            } as MediaEncodingConfiguration),
+            1500,
+          );
+          if (info?.supported && info.powerEfficient) hardware.add(name);
+        } catch {
+          /* unknown -> treat as software */
+        }
+      }),
+    );
+  }
+  const recv = orderVideoCodecs(recvCaps, { hardware, sendable });
+  const send = orderVideoCodecs(sendCaps, { hardware, sendable });
+  console.info(
+    `[call-engine] screen codec order: ${recv
+      .filter((c) => !/rtx|red|ulpfec|flexfec/i.test(c.mimeType))
+      .map((c) => codecName(c.mimeType) + (c.sdpFmtpLine?.includes("profile-level-id") ? `(${/profile-level-id=(\w+)/.exec(c.sdpFmtpLine)?.[1]})` : ""))
+      .join(" > ")}; hardware: [${[...hardware].join(",") || "none"}]`,
+  );
+  return { recv, send };
 }

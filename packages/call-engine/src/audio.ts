@@ -4,6 +4,8 @@
  * Local:  mic -> MediaStreamSource -> Analyser (level/VAD)
  *                                  \-> Gate GainNode -> MediaStreamDestination (track sent to all peers)
  * Remote: <audio muted> + MediaStreamSource -> Analyser (speaking) -> peer Gain -> master Gain -> ctx.destination
+ * Screen: <audio muted> + MediaStreamSource -> stream Gain -> Analyser (diagnostics only) -> master Gain
+ *         (separate per-user volume; never feeds the speaking indicator; deafen = master)
  */
 import { rms, levelFromRms } from "./vad";
 
@@ -39,6 +41,7 @@ export class AudioEngine {
   private micStream: MediaStream | null = null;
   private micSource: MediaStreamAudioSourceNode | null = null;
   private readonly remotes = new Map<string, RemoteNode>();
+  private readonly streamAudio = new Map<string, RemoteNode>();
   private gateOpen = false;
   private closed = false;
   private sinkId: string | undefined;
@@ -227,6 +230,71 @@ export class AudioEngine {
     return [...this.remotes.keys()];
   }
 
+  // --- screen-share audio ----------------------------------------------------
+
+  /** Play a remote screen share's audio track (stereo) with its own gain. */
+  addStreamAudio(userId: string, track: MediaStreamTrack, gain: number): void {
+    if (this.closed) return;
+    const existing = this.streamAudio.get(userId);
+    if (existing && existing.trackId === track.id) return;
+    this.removeStreamAudio(userId);
+    const stream = new MediaStream([track]);
+    const element = new Audio();
+    element.muted = true; // Chromium workaround, see addRemote
+    element.autoplay = true;
+    element.srcObject = stream;
+    element.play().catch(() => {
+      /* harmless */
+    });
+    const source = this.ctx.createMediaStreamSource(stream);
+    const g = this.ctx.createGain();
+    g.gain.value = gain;
+    const analyser = this.ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0;
+    source.connect(g);
+    g.connect(this.master);
+    g.connect(analyser);
+    this.streamAudio.set(userId, { stream, trackId: track.id, element, source, analyser, gain: g });
+    void this.resume();
+  }
+
+  removeStreamAudio(userId: string): void {
+    const r = this.streamAudio.get(userId);
+    if (!r) return;
+    this.streamAudio.delete(userId);
+    for (const n of [r.source, r.analyser, r.gain]) {
+      try {
+        n.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+    r.element.pause();
+    r.element.srcObject = null;
+    r.element.remove();
+  }
+
+  setStreamGain(userId: string, gain: number): void {
+    const r = this.streamAudio.get(userId);
+    if (!r || this.closed) return;
+    const now = this.ctx.currentTime;
+    r.gain.gain.cancelScheduledValues(now);
+    r.gain.gain.setTargetAtTime(gain, now, REMOTE_GAIN_TC);
+  }
+
+  hasStreamAudio(userId: string): boolean {
+    return this.streamAudio.has(userId);
+  }
+
+  /** Normalized 0..1 level of a remote screen share's audio after its volume (diagnostics / tests). */
+  readStreamLevel(userId: string): number {
+    const r = this.streamAudio.get(userId);
+    if (!r) return 0;
+    r.analyser.getFloatTimeDomainData(this.analysisBuf);
+    return levelFromRms(rms(this.analysisBuf));
+  }
+
   /** Route output to a device. Returns false if unsupported. */
   async setSinkId(deviceId: string): Promise<boolean> {
     this.sinkId = deviceId;
@@ -243,6 +311,7 @@ export class AudioEngine {
   close(): void {
     if (this.closed) return;
     for (const id of [...this.remotes.keys()]) this.removeRemote(id);
+    for (const id of [...this.streamAudio.keys()]) this.removeStreamAudio(id);
     this.closed = true;
     this.ctx.onstatechange = null;
     try {

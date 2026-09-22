@@ -21,7 +21,9 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const DIST = path.join(__dirname, "dist");
-const HARD_TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS || 90_000);
+const HARD_TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS || 240_000);
+/** E2E_SCREEN_ONLY=1 skips the voice scenarios 2-6 (for iterating on screen share). */
+const SCREEN_ONLY = !!process.env.E2E_SCREEN_ONLY;
 const VERBOSE = !!process.env.E2E_VERBOSE;
 
 app.commandLine.appendSwitch("use-fake-device-for-media-stream");
@@ -382,6 +384,17 @@ async function main() {
     ...(m1.ok && !VERBOSE ? [] : await debugDump(trio, stuckNames(m1.status, trio))),
   ]);
 
+  if (!SCREEN_ONLY) await voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming });
+  await screenScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+
+  for (const c of all) {
+    try {
+      await c.call("leave");
+    } catch {}
+  }
+}
+
+async function voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming }) {
   // 2. audio flows -----------------------------------------------------------
   {
     const samples = await Promise.all(trio.map((c) => c.call("sampleAudio", 3000)));
@@ -540,11 +553,351 @@ async function main() {
       ...(m.ok && !VERBOSE ? [] : await debugDump(all, stuckNames(status, all))),
     ]);
   }
+}
 
-  for (const c of all) {
+// ---------------------------------------------------------------------------
+// screen share scenarios
+
+const kb = (x) => (x == null ? "?" : `${Math.round(x)}`);
+function fmtVideo(v) {
+  if (!v) return "none";
+  return `${v.w ?? "?"}x${v.h ?? "?"} @${v.fps ?? "?"}fps codec=${v.codec ?? "?"}${v.encoder ? ` enc=${v.encoder}` : ""}${v.decoder ? ` dec=${v.decoder}` : ""}${v.qlr ? ` qlr=${v.qlr}` : ""}`;
+}
+function rateKbps(a, b, key = "bytes") {
+  if (!a || !b || b.ts <= a.ts) return null;
+  return ((b[key] - a[key]) * 8) / (b.ts - a.ts);
+}
+function evs(c, type, pred = () => true) {
+  return c.events.filter((e) => e.type === type && pred(e));
+}
+function lastEv(c, type, pred = () => true) {
+  const l = evs(c, type, pred);
+  return l[l.length - 1];
+}
+async function waitEvent(clients, c, type, pred, timeoutMs, what) {
+  const t = now();
+  await waitFor(
+    async () => {
+      await drainAll(clients);
+      return !!lastEv(c, type, pred);
+    },
+    timeoutMs,
+    what,
+    100,
+  );
+  return now() - t;
+}
+
+async function screenScenarios({ all, trio, A, B, C, D, E, byId, hangout }) {
+  // Back to a 3-person channel.
+  for (const c of [D, E]) await c.call("leave");
+  let m = await waitMesh(trio, 15_000);
+  if (!m.ok) {
+    for (const c of trio) await c.call("join", hangout);
+    m = await waitMesh(trio, 15_000);
+  }
+  await drainAll(all);
+  for (const c of all) c.events = [];
+  if (!m.ok) {
+    record("screen: precondition 3-peer mesh", false, fmtMesh(m.status));
+    return;
+  }
+  const name = (id) => byId.get(id) || id;
+
+  // S1. alice shares (gaming), bob watches ---------------------------------------
+  let s1ok = false;
+  {
+    const lines = [];
+    const started = await A.call("startShare", "gaming");
+    lines.push(`alice capture: ${started.settings.width}x${started.settings.height}@${started.settings.frameRate} contentHint=${started.contentHint} tracks=${started.tracks}`);
+    await sleep(300);
+    const t0 = now();
+    await B.call("watch", A.id, true);
+    let firstMs = null;
     try {
-      await c.call("leave");
+      firstMs = await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && e.stream, 5000, "bob remoteScreen(alice)");
     } catch {}
+    const rs = lastEv(B, "remoteScreen", (e) => e.userId === A.id && e.stream);
+    // Poll inbound video until >= 1280x720 @ >= 30 fps.
+    const timeline = [];
+    let reachedMs = null;
+    let prevIn = null;
+    let last = null;
+    while (now() - t0 < 9000) {
+      const st = await B.call("mediaStats");
+      const vi = st[A.id]?.videoIn;
+      if (vi) {
+        const r = rateKbps(prevIn, vi);
+        timeline.push(`${((now() - t0) / 1000).toFixed(1)}s ${vi.w}x${vi.h}@${vi.fps ?? "?"} ${kb(r)}kbps`);
+        prevIn = vi;
+        last = { ...vi, kbps: r };
+        if (reachedMs === null && vi.w >= 1280 && vi.h >= 720 && (vi.fps ?? 0) >= 30) reachedMs = now() - t0;
+      }
+      if (reachedMs !== null && now() - t0 > reachedMs + 2500) break;
+      await sleep(500);
+    }
+    const aStats = await A.call("mediaStats");
+    const out = aStats[B.id];
+    const probe = await B.call("probeRemoteVideo", A.id, 1500);
+    await drainAll(all);
+    const viewers = lastEv(A, "viewers");
+    const recvStats = lastEv(B, "streamStats", (e) => e.direction === "recv" && e.userId === A.id);
+    const sendStats = lastEv(A, "streamStats", (e) => e.direction === "send" && e.viewerId === B.id);
+    s1ok = !!rs && firstMs !== null && reachedMs !== null && reachedMs <= 6000 && viewers?.userIds?.length === 1 && viewers.userIds[0] === B.id;
+    lines.push(
+      `bob remoteScreen after ${firstMs ?? "never"} ms (${rs?.tracks ?? "-"}); inbound >=1280x720@>=30fps after ${reachedMs ?? "never"} ms`,
+      `bob inbound: ${fmtVideo(last)} ~${kb(last?.kbps)} kbps`,
+      `alice outbound->bob: ${fmtVideo(out?.videoOut)} target=${kb((out?.videoOut?.target ?? 0) / 1000)}kbps powerEfficient=${out?.videoOut?.powerEfficient}`,
+      `alice sender params: ${JSON.stringify(out?.videoSenderParams)}`,
+      `alice capture source (media-source stats): ${JSON.stringify(out?.videoSource)}; canvas draws so far: ${await A.exec("window.__drawCount ? window.__drawCount() : -1")}`,
+      `<video muted> renders ${probe.videoWidth}x${probe.videoHeight} ~${probe.renderedFps}fps (audio tracks in stream: ${probe.audioTracksInStream})`,
+      `engine streamStats recv: ${JSON.stringify(recvStats && { ...recvStats, t: undefined, type: undefined, userId: name(recvStats.userId) })}`,
+      `engine streamStats send: ${JSON.stringify(sendStats && { ...sendStats, t: undefined, type: undefined, userId: name(sendStats.userId), viewerId: name(sendStats.viewerId) })}`,
+      `alice viewers: [${(viewers?.userIds ?? []).map(name)}]`,
+      `timeline: ${timeline.join(" | ")}`,
+      ...errorsOf(trio),
+    );
+    record("screen 1: alice shares, bob watches -> remoteScreen + >=720p30 within ~5s", s1ok, lines);
+  }
+
+  // S2. screen audio -----------------------------------------------------------------
+  {
+    await A.call("setMuted", true); // mic silent: any 'speaking' for alice at bob would come from screen audio
+    await sleep(800);
+    await drainAll(all);
+    const a0 = (await A.call("mediaStats"))[B.id]?.screenAudioOut;
+    const an = await B.call("analyseScreenAudio", A.id, 3000);
+    const a1 = (await A.call("mediaStats"))[B.id]?.screenAudioOut;
+    const aIn = (await B.call("mediaStats"))[A.id]?.screenAudioIn;
+    await B.call("setStreamVolume", A.id, 0);
+    await sleep(400);
+    const anMuted = await B.call("analyseScreenAudio", A.id, 800);
+    await B.call("setStreamVolume", A.id, 1);
+    await A.call("setMuted", false);
+    await sleep(1000);
+    const micBack = await B.call("analyseScreenAudio", A.id, 1500);
+    await drainAll(all);
+    const near = (hz, want) => Math.abs(hz - want) <= 25;
+    const hasTone = near(an.leftHz, 1000) || near(an.rightHz, 1000);
+    const stereo = near(an.leftHz, 1000) && near(an.rightHz, 1500);
+    const screenKbps = rateKbps(a0, a1);
+    const ok =
+      !an.error &&
+      hasTone &&
+      an.speakingOn === 0 &&
+      an.engineStreamLevelMax > 0.05 &&
+      anMuted.engineStreamLevelMax < 0.02 &&
+      an.micMsidDiffers &&
+      an.screenAudioSameMsidAsVideo;
+    record("screen 2: bob hears alice's screen audio separately from her mic; no speaking indicator", ok, [
+      `screen audio at bob: L=${an.leftHz} Hz R=${an.rightHz} Hz (sent L=1000 R=1500) -> ${stereo ? "STEREO preserved" : "not stereo"}; rms L=${an.rmsL} R=${an.rmsR}`,
+      `mic track at bob (alice muted): dominant ${an.micHz} Hz; after unmute: ${micBack.micHz} Hz (fake-device beep)`,
+      `msid streams: screen audio ${JSON.stringify(an.msid?.screenAudio)} video ${JSON.stringify(an.msid?.screenVideo)} mic ${JSON.stringify(an.msid?.mic)}`,
+      `engine screen-audio level (after stream volume): ${an.engineStreamLevelMax}; with setStreamVolume(0): ${anMuted.engineStreamLevelMax}`,
+      `speaking-on events for alice at bob while only screen audio plays: ${an.speakingOn}`,
+      `alice screen-audio out: ~${kb(screenKbps)} kbps, codec ${a1?.codec}; bob screen-audio in codec ${aIn?.codec}`,
+      ...(an.error ? [`error: ${JSON.stringify(an)}`] : []),
+    ]);
+  }
+
+  // S3. carol does not watch --------------------------------------------------------------
+  {
+    const c0 = (await C.call("mediaStats"))[A.id];
+    const a0 = (await A.call("mediaStats"))[C.id];
+    await sleep(2000);
+    const c1 = (await C.call("mediaStats"))[A.id];
+    const a1 = (await A.call("mediaStats"))[C.id];
+    await drainAll(all);
+    const viewers = lastEv(A, "viewers");
+    const carolBytes = (c1?.videoIn?.bytes ?? 0) - (c0?.videoIn?.bytes ?? 0);
+    const aliceToCarol = (a1?.videoOut?.bytes ?? 0) - (a0?.videoOut?.bytes ?? 0);
+    const carolScreens = evs(C, "remoteScreen");
+    const ok = (c1?.videoIn?.bytes ?? 0) === 0 && aliceToCarol === 0 && viewers?.userIds?.length === 1 && viewers.userIds[0] === B.id && carolScreens.length === 0;
+    record("screen 3: carol doesn't watch -> no video bytes to carol; viewers = [bob]", ok, [
+      `carol inbound video bytes total=${c1?.videoIn?.bytes ?? 0} (+${carolBytes} in 2s); alice outbound video to carol +${aliceToCarol} B`,
+      `carol transceivers with alice: ${c1?.transceivers}`,
+      `alice viewers: [${(viewers?.userIds ?? []).map(name)}]; carol remoteScreen events: ${carolScreens.length}`,
+    ]);
+  }
+
+  // S4. bob unwatches, then watches again ---------------------------------------------------
+  {
+    for (const c of all) c.events = [];
+    await B.call("watch", A.id, false);
+    let nullMs = null;
+    let viewersEmptyMs = null;
+    try {
+      nullMs = await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && !e.stream, 3000, "bob remoteScreen null");
+      viewersEmptyMs = await waitEvent(all, A, "viewers", (e) => e.userIds.length === 0, 3000, "alice viewers []");
+    } catch {}
+    await sleep(1000);
+    const o0 = (await A.call("mediaStats"))[B.id]?.videoOut;
+    await sleep(1500);
+    const o1 = (await A.call("mediaStats"))[B.id]?.videoOut;
+    const stoppedSending = (o1?.bytes ?? 0) - (o0?.bytes ?? 0) === 0;
+    const bobAudio = await B.call("mediaStats");
+    for (const c of all) c.events = [];
+    const t = now();
+    await B.call("watch", A.id, true);
+    let againMs = null;
+    try {
+      againMs = await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && e.stream, 5000, "bob remoteScreen again");
+    } catch {}
+    await sleep(1500);
+    const i0 = (await B.call("mediaStats"))[A.id]?.videoIn;
+    await sleep(1000);
+    const i1 = (await B.call("mediaStats"))[A.id]?.videoIn;
+    await drainAll(all);
+    const viewers = lastEv(A, "viewers");
+    const flowing = (i1?.framesDecoded ?? 0) > (i0?.framesDecoded ?? 0);
+    const ok = nullMs !== null && viewersEmptyMs !== null && stoppedSending && againMs !== null && flowing && viewers?.userIds?.[0] === B.id;
+    record("screen 4: unwatch -> null + viewers []; watch again -> works", ok, [
+      `unwatch: bob remoteScreen null after ${nullMs ?? "never"} ms; alice viewers [] after ${viewersEmptyMs ?? "never"} ms; alice->bob video stopped: ${stoppedSending}`,
+      `bob<->alice transceivers after unwatch: ${bobAudio[A.id]?.transceivers}`,
+      `re-watch: remoteScreen after ${againMs ?? "never"} ms (${now() - t} ms total); frames decoding: ${flowing} (${fmtVideo(i1)}); alice viewers: [${(viewers?.userIds ?? []).map(name)}]`,
+    ]);
+  }
+
+  // S5. preset gaming -> text -----------------------------------------------------------------
+  {
+    await sleep(2500);
+    await drainAll(all);
+    const before = lastEv(A, "streamStats", (e) => e.direction === "send" && e.viewerId === B.id);
+    const beforeRecv = lastEv(B, "streamStats", (e) => e.direction === "recv" && e.userId === A.id);
+    const beforeParams = (await A.call("mediaStats"))[B.id]?.videoSenderParams;
+    for (const c of all) c.events = [];
+    const settings = await A.call("setPreset", "text");
+    await sleep(5000);
+    await drainAll(all);
+    const after = lastEv(A, "streamStats", (e) => e.direction === "send" && e.viewerId === B.id);
+    const afterRecv = lastEv(B, "streamStats", (e) => e.direction === "recv" && e.userId === A.id);
+    const params = (await A.call("mediaStats"))[B.id]?.videoSenderParams;
+    const f = (s) => (s ? `${s.width}x${s.height}@${s.fps}fps ${s.bitrateKbps}kbps ${s.codec} ql=${s.qualityLimitation ?? "-"}` : "none");
+    const ok =
+      !!after &&
+      (after.fps ?? 99) <= 17 &&
+      (after.width ?? 0) >= 1280 &&
+      params?.enc?.maxFramerate === 15 &&
+      params?.enc?.maxBitrate === 5_000_000 &&
+      params?.degradationPreference === "maintain-resolution" &&
+      (!!afterRecv && (afterRecv.fps ?? 99) <= 17);
+    record("screen 5: preset gaming -> text is applied live and visible in stats", ok, [
+      `gaming: send ${f(before)} | recv ${f(beforeRecv)} | params ${JSON.stringify(beforeParams)}`,
+      `text:   send ${f(after)} | recv ${f(afterRecv)} | params ${JSON.stringify(params)}`,
+      `capture settings after setPreset: ${settings ? `${settings.width}x${settings.height}@${settings.frameRate}` : "?"}`,
+    ]);
+  }
+
+  // S6. stop -> null; restart; rejoin + rewatch; replacement; OS-ended -------------------------------
+  {
+    for (const c of all) c.events = [];
+    await A.call("stopShare");
+    let nullMs = null;
+    try {
+      nullMs = await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && !e.stream, 3000, "bob null after stop");
+    } catch {}
+    await drainAll(all);
+    const viewersAfterStop = lastEv(A, "viewers");
+    const sharingAfterStop = (await A.call("screenState")).sharing;
+
+    // Restart: bob's watch intent is remembered on both sides -> bob gets it again.
+    for (const c of all) c.events = [];
+    await A.call("startShare", "balanced");
+    let restartMs = null;
+    try {
+      restartMs = await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && e.stream, 5000, "bob stream after restart");
+    } catch {}
+
+    // Carol leaves, rejoins during the share and watches (+ watch sent before her connection exists).
+    await C.call("leave");
+    await sleep(500);
+    await C.call("watch", A.id, true); // no connection yet: must be sent once the peer is created
+    await C.call("join", hangout);
+    let carolMs = null;
+    const tc = now();
+    try {
+      await waitEvent(all, C, "remoteScreen", (e) => e.userId === A.id && e.stream, 12_000, "carol stream after rejoin");
+      carolMs = now() - tc;
+    } catch {}
+    await drainAll(all);
+    const viewersBoth = lastEv(A, "viewers");
+
+    // Replacement share keeps viewers without a null blip (replaceTrack).
+    for (const c of all) c.events = [];
+    await A.call("startShare", "gaming");
+    await sleep(2500);
+    await drainAll(all);
+    const blips = evs(B, "remoteScreen", (e) => e.userId === A.id && !e.stream).length + evs(C, "remoteScreen", (e) => e.userId === A.id && !e.stream).length;
+    const i0 = await B.call("mediaStats");
+    await sleep(1000);
+    const i1 = await B.call("mediaStats");
+    const replaceFlowing = (i1[A.id]?.videoIn?.framesDecoded ?? 0) > (i0[A.id]?.videoIn?.framesDecoded ?? 0);
+
+    // Bob's connection to alice is recreated mid-share (reset): the watch is re-sent
+    // on the new connection and alice (remote-restarted) re-attaches.
+    for (const c of all) c.events = [];
+    await B.call("forceReset", A.id);
+    let resetMs = null;
+    const tr = now();
+    try {
+      await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && e.stream, 12_000, "bob stream after reset");
+      resetMs = now() - tr;
+    } catch {}
+    await drainAll(all);
+    const bobNullOnReset = evs(B, "remoteScreen", (e) => e.userId === A.id && !e.stream).length;
+    const viewersAfterReset = lastEv(A, "viewers") ?? { userIds: ["(unchanged)"] };
+
+    // OS ends the capture -> localScreenEnded + viewers get null.
+    for (const c of all) c.events = [];
+    await A.call("endShareExternally");
+    let endedOk = false;
+    try {
+      await waitEvent(all, A, "localScreenEnded", () => true, 2000, "localScreenEnded");
+      await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && !e.stream, 3000, "bob null after OS end");
+      await waitEvent(all, C, "remoteScreen", (e) => e.userId === A.id && !e.stream, 3000, "carol null after OS end");
+      endedOk = true;
+    } catch {}
+    const sharingAfterEnd = (await A.call("screenState")).sharing;
+    const ok =
+      nullMs !== null &&
+      viewersAfterStop?.userIds?.length === 0 &&
+      !sharingAfterStop &&
+      restartMs !== null &&
+      carolMs !== null &&
+      viewersBoth?.userIds?.length === 2 &&
+      blips === 0 &&
+      replaceFlowing &&
+      resetMs !== null &&
+      endedOk &&
+      !sharingAfterEnd;
+    record("screen 6: stop -> null; restart, rejoin+watch, replacement, connection reset and OS-ended all work", ok, [
+      `stop: bob null after ${nullMs ?? "never"} ms; alice viewers [${(viewersAfterStop?.userIds ?? []).map(name)}]; isScreenSharing=${sharingAfterStop}`,
+      `restart (balanced): bob receives again after ${restartMs ?? "never"} ms (remembered watch)`,
+      `carol leave -> watch (before connection) -> rejoin: remoteScreen after ${carolMs ?? "never"} ms; alice viewers [${(viewersBoth?.userIds ?? []).map(name)}]`,
+      `replacement share: null blips=${blips}, bob still decoding=${replaceFlowing}`,
+      `bob's connection to alice reset mid-share: null x${bobNullOnReset}, stream again after ${resetMs ?? "never"} ms; alice viewers event after reset: [${(viewersAfterReset.userIds ?? []).map(name)}]`,
+      `OS-ended capture: localScreenEnded + viewers null: ${endedOk}; isScreenSharing=${sharingAfterEnd}`,
+      ...errorsOf(trio),
+    ]);
+  }
+
+  // S7. voice still fine after all the renegotiations ---------------------------------------------
+  {
+    const m2 = await waitMesh(trio, 10_000);
+    const samples = await Promise.all(trio.map((c) => c.call("sampleAudio", 2500)));
+    let ok = m2.ok;
+    const lines = [];
+    trio.forEach((rx, i) => {
+      for (const tx of trio) {
+        if (tx === rx) continue;
+        const s = samples[i][tx.id];
+        const good = !!s && s.bytes > 0 && (s.maxLevel > 0.01 || s.meterPeak > 0.01);
+        if (!good) ok = false;
+        lines.push(`${rx.name} <- ${tx.name}: ${fmtAudio(s)} ${good ? "" : "<-- no audio"}`);
+      }
+    });
+    await drainAll(all);
+    record("screen 7: voice still flows on every leg after screen-share renegotiations", ok, [...fmtMesh(m2.status), ...lines, ...errorsOf(trio)]);
   }
 }
 

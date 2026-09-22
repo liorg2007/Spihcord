@@ -47,7 +47,9 @@ export interface PeerOptions {
   localTrack?: MediaStreamTrack | null;
   localStreams?: MediaStream[];
   send(data: SignalData): void;
-  onTrack?(track: MediaStreamTrack, stream: MediaStream | undefined): void;
+  onTrack?(track: MediaStreamTrack, stream: MediaStream | undefined, transceiver: RTCRtpTransceiver | undefined): void;
+  /** Signaling returned to 'stable' (a negotiation round completed or was rolled back). */
+  onNegotiated?(): void;
   onConnectionState?(state: RTCPeerConnectionState): void;
   onError?(message: string, cause?: unknown): void;
   /**
@@ -58,6 +60,12 @@ export interface PeerOptions {
   onReset?(reason: ResetReason, replay?: SignalData[]): void;
   /** Transform outgoing SDP (default: Opus voice munging). */
   mungeSdp?: (sdp: string) => string;
+  /**
+   * Consulted before each setLocalDescription. Return a transform to apply the
+   * description through createOffer/createAnswer + munged setLocalDescription;
+   * null (default) keeps the atomic parameterless setLocalDescription().
+   */
+  localSdpTransform?: () => ((sdp: string) => string) | null;
   timings?: Partial<PeerTimings>;
   /** Sender encoding parameters applied once connected; null to skip. */
   senderTuning?: SenderTuning | null;
@@ -76,6 +84,7 @@ export class Peer {
   private closed = false;
   private resetRequested = false;
   private senderTuned = false;
+  private micSender: RTCRtpSender | undefined;
   private initialOfferTimer: ReturnType<typeof setTimeout> | undefined;
 
   private disconnectTimer: Timer | undefined;
@@ -115,14 +124,17 @@ export class Peer {
     };
     pc.ontrack = (ev) => {
       if (this.closed) return;
-      this.opts.onTrack?.(ev.track, ev.streams?.[0]);
+      this.opts.onTrack?.(ev.track, ev.streams?.[0], ev.transceiver);
     };
     pc.onconnectionstatechange = () => this.handleConnectionState();
+    pc.onsignalingstatechange = () => {
+      if (!this.closed && this.pc.signalingState === "stable") this.opts.onNegotiated?.();
+    };
 
     if (opts.localTrack) {
-      pc.addTrack(opts.localTrack, ...(opts.localStreams ?? []));
+      this.micSender = pc.addTrack(opts.localTrack, ...(opts.localStreams ?? []));
     } else {
-      pc.addTransceiver("audio", { direction: "sendrecv" });
+      this.micSender = pc.addTransceiver("audio", { direction: "sendrecv" })?.sender;
     }
 
     this.armTeardown("connect-timeout", this.timings.connectTimeoutMs);
@@ -150,6 +162,7 @@ export class Peer {
       }
       return;
     }
+    if (data.kind !== "description") return; // 'stream' signals are handled by the owner
 
     const description = data.description;
     const hadRemote = !!pc.currentRemoteDescription;
@@ -174,8 +187,7 @@ export class Peer {
       }
       if (this.closed) return;
       if (description.type === "offer") {
-        await pc.setLocalDescription();
-        if (this.closed) return;
+        if (!(await this.setLocal()) || this.closed) return;
         this.sendLocalDescription();
       }
     } catch (err) {
@@ -219,6 +231,7 @@ export class Peer {
     pc.onicecandidate = null;
     pc.ontrack = null;
     pc.onconnectionstatechange = null;
+    pc.onsignalingstatechange = null;
     try {
       pc.close();
     } catch {
@@ -242,7 +255,7 @@ export class Peer {
     }
     try {
       this.makingOffer = true;
-      await this.pc.setLocalDescription();
+      if (!(await this.setLocal())) return;
       if (this.closed) return;
       this.sendLocalDescription();
     } catch (err) {
@@ -250,6 +263,33 @@ export class Peer {
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  /**
+   * setLocalDescription, optionally through a munged createOffer/createAnswer.
+   * Returns false when the signaling state moved on meanwhile (an incoming
+   * offer won the race); negotiationneeded fires again once stable.
+   */
+  private async setLocal(): Promise<boolean> {
+    const pc = this.pc;
+    const transform = this.opts.localSdpTransform?.() ?? null;
+    if (!transform) {
+      await pc.setLocalDescription();
+      return true;
+    }
+    const state = pc.signalingState;
+    if (state !== "stable" && state !== "have-remote-offer") return false;
+    const desc = state === "have-remote-offer" ? await pc.createAnswer() : await pc.createOffer();
+    if (this.closed || pc.signalingState !== state) return false;
+    try {
+      await pc.setLocalDescription({ type: desc.type, sdp: transform(desc.sdp ?? "") });
+    } catch (err) {
+      if (this.closed || pc.signalingState !== state) return false;
+      // Munged SDP rejected: fall back to the plain description.
+      console.warn(`[call-engine] munged local ${desc.type} rejected, using the plain one`, err);
+      await pc.setLocalDescription();
+    }
+    return true;
   }
 
   private sendLocalDescription(): void {
@@ -329,8 +369,8 @@ export class Peer {
     const tuning = this.opts.senderTuning;
     if (this.senderTuned || !tuning) return;
     this.senderTuned = true;
-    for (const sender of this.pc.getSenders()) {
-      if (sender.track && sender.track.kind !== "audio") continue;
+    // Only the mic sender: screen-share senders are tuned by their owner.
+    for (const sender of this.micSender ? [this.micSender] : []) {
       try {
         const params = sender.getParameters();
         if (!params.encodings || params.encodings.length === 0) continue;

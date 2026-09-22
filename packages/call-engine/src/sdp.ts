@@ -108,3 +108,110 @@ export function extractFingerprint(sdp: string | undefined | null): string | und
   const m = /^a=fingerprint:(.+)$/m.exec(sdp);
   return m ? m[1].trim().toLowerCase() : undefined;
 }
+
+// ---------------------------------------------------------------------------
+// Per-media-section munging (screen share)
+
+/** Opus parameters for screen-share audio (music/game audio): stereo, 128 kbps, no DTX. */
+export const SCREEN_AUDIO_OPUS_PARAMS: FmtpParams = {
+  stereo: 1,
+  "sprop-stereo": 1,
+  maxaveragebitrate: 128000,
+  usedtx: 0,
+  useinbandfec: 1,
+};
+
+/**
+ * Bitrate hints (kbps) for every video codec. Chromium reads x-google-* from the
+ * *send* codec, i.e. from the remote description: hints we put in our outgoing
+ * SDP shape how the other side sends to us (the sharer's encoder starts at
+ * start-bitrate instead of ramping up from ~300 kbps).
+ */
+export const VIDEO_BITRATE_HINTS: FmtpParams = {
+  "x-google-start-bitrate": 4000,
+  "x-google-min-bitrate": 1000,
+  "x-google-max-bitrate": 25000,
+};
+
+export const HINTED_VIDEO_CODECS: readonly string[] = ["VP8", "VP9", "H264", "AV1", "H265"];
+
+export interface SdpSection {
+  /** "audio" | "video" | "application"; undefined for the session section. */
+  kind?: string;
+  mid?: string;
+  text: string;
+}
+
+/** Split into the session section followed by one section per m-line (text keeps its EOLs). */
+export function splitSdpSections(sdp: string): SdpSection[] {
+  const parts = sdp.split(/(?=^m=)/m);
+  return parts.map((text, i) => {
+    if (i === 0 && !text.startsWith("m=")) return { text };
+    const kind = /^m=(\w+)/.exec(text)?.[1];
+    const mid = /^a=mid:(\S+)/m.exec(text)?.[1];
+    return { kind, mid, text };
+  });
+}
+
+export interface CallSdpOptions {
+  /** mid of the microphone m-line; undefined/null = the first audio m-line. */
+  micMid?: string | null;
+  /** Opus params for the mic m-line (null = leave untouched). */
+  voiceOpus?: FmtpParams | null;
+  /** Opus params for every other audio m-line (screen-share audio). */
+  screenOpus?: FmtpParams | null;
+  /** fmtp params added to every video codec (null = none). */
+  videoHints?: FmtpParams | null;
+}
+
+/**
+ * Apply Opus params per audio m-line (mic vs screen audio share payload type
+ * 111 but each m-line carries its own fmtp; Chromium accepts differing fmtp for
+ * the same PT across bundled m-lines) and bitrate hints on video m-lines.
+ */
+export function mungeCallSdp(sdp: string, opts: CallSdpOptions): string {
+  const sections = splitSdpSections(sdp);
+  const micMid = opts.micMid ?? undefined;
+  const firstAudio = sections.find((s) => s.kind === "audio");
+  return sections
+    .map((s) => {
+      if (s.kind === "audio") {
+        const isMic = micMid !== undefined && sections.some((x) => x.mid === micMid) ? s.mid === micMid : s === firstAudio;
+        const params = isMic ? opts.voiceOpus : opts.screenOpus;
+        return params ? mungeCodecFmtp(s.text, params, "opus") : s.text;
+      }
+      if (s.kind === "video" && opts.videoHints) {
+        let text = s.text;
+        for (const codec of HINTED_VIDEO_CODECS) text = mungeCodecFmtp(text, opts.videoHints, codec);
+        return text;
+      }
+      return s.text;
+    })
+    .join("");
+}
+
+/** Outgoing SDP for a call with screen share: voice Opus on the mic, stereo on screen audio, video bitrate hints. */
+export function mungeOutgoingSdp(sdp: string, micMid?: string | null): string {
+  return mungeCallSdp(sdp, {
+    micMid,
+    voiceOpus: VOICE_OPUS_PARAMS,
+    screenOpus: SCREEN_AUDIO_OPUS_PARAMS,
+    videoHints: VIDEO_BITRATE_HINTS,
+  });
+}
+
+/**
+ * Local description munging: Chromium configures the Opus *decoder* from the
+ * local description, so `stereo=1` must be there for received screen audio to
+ * be decoded as stereo. Only non-mic audio m-lines are touched.
+ */
+export function mungeLocalSdp(sdp: string, micMid?: string | null): string {
+  return mungeCallSdp(sdp, { micMid, voiceOpus: null, screenOpus: SCREEN_AUDIO_OPUS_PARAMS, videoHints: null });
+}
+
+/** Does the SDP have an audio m-line other than the mic one? */
+export function hasScreenAudioSection(sdp: string, micMid?: string | null): boolean {
+  const audio = splitSdpSections(sdp).filter((s) => s.kind === "audio");
+  if (micMid == null) return audio.length > 1;
+  return audio.some((s) => s.mid !== micMid);
+}
