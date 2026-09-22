@@ -1,0 +1,13 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy hub:8420
+	}
+	handle /ws {
+		reverse_proxy hub:8420
+	}
+	handle {
+		respond "Shpihcord hub" 200
+	}
+}
