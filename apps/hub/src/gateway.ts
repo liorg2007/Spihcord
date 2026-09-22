@@ -252,7 +252,8 @@ export class Gateway {
     const muted = current?.muted ?? false;
     const deafened = current?.deafened ?? false;
     if (current) this.leaveVoice(userId);
-    const state: VoiceState = { userId, channelId: channel.id, muted, deafened };
+    // A screen share does not follow the user into another channel.
+    const state: VoiceState = { userId, channelId: channel.id, muted, deafened, streaming: false };
     this.voice.set(userId, state);
     this.broadcast({ type: "voice.state", voiceState: state });
   }
@@ -263,8 +264,9 @@ export class Gateway {
       this.send(conn, { type: "error", code: "not_in_voice", message: "You are not in a voice channel." });
       return;
     }
-    if (current.muted === msg.muted && current.deafened === msg.deafened) return;
-    const state: VoiceState = { ...current, muted: msg.muted, deafened: msg.deafened };
+    const streaming = msg.streaming ?? current.streaming;
+    if (current.muted === msg.muted && current.deafened === msg.deafened && current.streaming === streaming) return;
+    const state: VoiceState = { ...current, muted: msg.muted, deafened: msg.deafened, streaming };
     this.voice.set(state.userId, state);
     this.broadcast({ type: "voice.state", voiceState: state });
   }

@@ -5,7 +5,7 @@
  */
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // Entities
@@ -32,6 +32,8 @@ export const VoiceStateSchema = z.object({
   channelId: z.string(),
   muted: z.boolean(),
   deafened: z.boolean(),
+  /** User is sharing their screen (viewers opt in with a `stream` signal). */
+  streaming: z.boolean(),
 });
 export type VoiceState = z.infer<typeof VoiceStateSchema>;
 
@@ -65,6 +67,11 @@ export const SignalDataSchema = z.union([
         usernameFragment: z.string().nullable().optional(),
       })
       .nullable(),
+  }),
+  /** Viewer -> sharer: start/stop sending me your screen share. */
+  z.object({
+    kind: z.literal("stream"),
+    action: z.enum(["watch", "unwatch"]),
   }),
 ]);
 export type SignalData = z.infer<typeof SignalDataSchema>;
@@ -112,6 +119,9 @@ export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
 // 2. Hub replies `ready` with a full snapshot (or `error` + close on failure,
 //    e.g. code "outdated_client" when protocolVersion mismatches).
 // 3. Hub sends `ping` every 25s; client answers `pong`.
+//
+// Close codes: 4001 unauthorized, 4002 outdated_client, 4003 session_replaced,
+// 4004 auth_timeout, 4008 rate limited, 1001 server shutdown.
 
 export const ClientMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("auth"), token: z.string(), protocolVersion: z.number().int() }),
@@ -119,7 +129,13 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
   /** Join (or switch to) a voice channel. Leaves the previous one implicitly. */
   z.object({ type: z.literal("voice.join"), channelId: z.string() }),
   z.object({ type: z.literal("voice.leave") }),
-  z.object({ type: z.literal("voice.update"), muted: z.boolean(), deafened: z.boolean() }),
+  z.object({
+    type: z.literal("voice.update"),
+    muted: z.boolean(),
+    deafened: z.boolean(),
+    /** Omitted = unchanged. */
+    streaming: z.boolean().optional(),
+  }),
   /** Relay a WebRTC signal to another user in the same voice channel. */
   z.object({ type: z.literal("rtc.signal"), to: z.string(), data: SignalDataSchema }),
 ]);

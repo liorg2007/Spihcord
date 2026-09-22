@@ -29,6 +29,40 @@ export interface VoiceCallOptions {
 
 export type InputMode = "voice-activity" | "push-to-talk";
 
+// ---------------------------------------------------------------------------
+// Screen share
+// ---------------------------------------------------------------------------
+
+export type ScreenSharePresetId = "text" | "balanced" | "gaming" | "source";
+
+export interface ScreenSharePreset {
+  id: ScreenSharePresetId;
+  label: string;
+  /** Max capture size; the source is never upscaled. */
+  maxWidth: number;
+  maxHeight: number;
+  frameRate: number;
+  /** Per-viewer video bitrate cap, bits/s. */
+  maxBitrate: number;
+  contentHint: "motion" | "detail" | "text";
+}
+
+export interface StreamStats {
+  /** The sharer (for "recv", the remote user; for "send", selfId). */
+  userId: string;
+  direction: "send" | "recv";
+  /** For "send": which viewer this encoding goes to. */
+  viewerId?: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+  bitrateKbps?: number;
+  /** e.g. "AV1", "H264", "VP9", "VP8". */
+  codec?: string;
+  /** RTCOutboundRtpStreamStats.qualityLimitationReason ("send" only). */
+  qualityLimitation?: "none" | "cpu" | "bandwidth" | "other";
+}
+
 export type PeerRoute = "direct" | "relay" | "unknown";
 
 export interface PeerInfo {
@@ -54,6 +88,19 @@ export interface VoiceCallEvents {
   /** Local mic level 0..1, ~20 Hz, for the settings meter. */
   localLevel: { level: number };
   error: { message: string; cause?: unknown };
+
+  /**
+   * A remote screen share we are watching became available (stream != null) or went
+   * away (null). The stream holds the video track (attach to a <video muted>);
+   * its audio is played by the engine (see setStreamVolume), never by the element.
+   */
+  remoteScreen: { userId: string; stream: MediaStream | null };
+  /** Our local share stopped on its own (e.g. the captured window closed / OS "Stop sharing"). */
+  localScreenEnded: Record<string, never>;
+  /** Users currently receiving our screen share. */
+  viewers: { userIds: string[] };
+  /** ~every 2s per active screen stream (sent or received). */
+  streamStats: StreamStats;
 }
 
 export interface VoiceCall {
@@ -80,6 +127,23 @@ export interface VoiceCall {
   setIceServers(iceServers: IceServer[]): void;
 
   getPeers(): PeerInfo[];
+
+  /**
+   * Start sharing a captured screen/window. The app obtains `stream` (video track
+   * + optional system-audio track) via getDisplayMedia; the engine takes ownership
+   * (stops the tracks on stopScreenShare/close). Nothing is sent until a peer
+   * calls watch; then video+audio tracks are added to that peer only.
+   * Replaces a previous share if one is active.
+   */
+  startScreenShare(stream: MediaStream, preset: ScreenSharePresetId): Promise<void>;
+  /** Change quality live (applyConstraints + sender parameters for all viewers). */
+  setScreenSharePreset(preset: ScreenSharePresetId): Promise<void>;
+  stopScreenShare(): void;
+  isScreenSharing(): boolean;
+  /** Ask a sharer in our channel to start/stop sending us their screen. */
+  watchStream(userId: string, watching: boolean): void;
+  /** 0..2 playback volume of a remote screen share's audio. */
+  setStreamVolume(userId: string, volume: number): void;
 
   on<K extends keyof VoiceCallEvents>(event: K, handler: (payload: VoiceCallEvents[K]) => void): () => void;
 

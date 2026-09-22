@@ -152,7 +152,7 @@ describe("gateway", () => {
     const [hangout, gaming] = voiceChannels(ready);
 
     a.send({ type: "voice.join", channelId: hangout.id });
-    const expected = { userId: alice.user.id, channelId: hangout.id, muted: false, deafened: false };
+    const expected = { userId: alice.user.id, channelId: hangout.id, muted: false, deafened: false, streaming: false };
     expect((await b.next("voice.state")).voiceState).toEqual(expected);
     expect((await a.next("voice.state")).voiceState).toEqual(expected);
 
@@ -164,8 +164,17 @@ describe("gateway", () => {
     a.send({ type: "voice.update", muted: true, deafened: false });
     expect((await b.next("voice.state")).voiceState.muted).toBe(true);
 
+    a.send({ type: "voice.update", muted: true, deafened: false, streaming: true });
+    expect((await b.next("voice.state")).voiceState.streaming).toBe(true);
+    // Omitting `streaming` keeps it.
+    a.send({ type: "voice.update", muted: false, deafened: false });
+    expect((await b.next("voice.state")).voiceState).toMatchObject({ muted: false, streaming: true });
+    a.send({ type: "voice.update", muted: true, deafened: false });
+    await b.next("voice.state");
+
     a.send({ type: "voice.join", channelId: gaming.id });
     expect(await b.next("voice.left")).toMatchObject({ userId: alice.user.id, channelId: hangout.id });
+    // Switching channels ends the screen share.
     expect((await b.next("voice.state")).voiceState).toEqual({ ...expected, channelId: gaming.id, muted: true });
 
     a.send({ type: "voice.leave" });
