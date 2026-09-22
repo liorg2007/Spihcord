@@ -252,8 +252,8 @@ export class Gateway {
     const muted = current?.muted ?? false;
     const deafened = current?.deafened ?? false;
     if (current) this.leaveVoice(userId);
-    // A screen share does not follow the user into another channel.
-    const state: VoiceState = { userId, channelId: channel.id, muted, deafened, streaming: false };
+    // Screen share and camera do not follow the user into another channel.
+    const state: VoiceState = { userId, channelId: channel.id, muted, deafened, streaming: false, video: false };
     this.voice.set(userId, state);
     this.broadcast({ type: "voice.state", voiceState: state });
   }
@@ -265,8 +265,15 @@ export class Gateway {
       return;
     }
     const streaming = msg.streaming ?? current.streaming;
-    if (current.muted === msg.muted && current.deafened === msg.deafened && current.streaming === streaming) return;
-    const state: VoiceState = { ...current, muted: msg.muted, deafened: msg.deafened, streaming };
+    const video = msg.video ?? current.video;
+    if (
+      current.muted === msg.muted &&
+      current.deafened === msg.deafened &&
+      current.streaming === streaming &&
+      current.video === video
+    )
+      return;
+    const state: VoiceState = { ...current, muted: msg.muted, deafened: msg.deafened, streaming, video };
     this.voice.set(state.userId, state);
     this.broadcast({ type: "voice.state", voiceState: state });
   }

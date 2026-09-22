@@ -47,10 +47,19 @@ export interface ScreenSharePreset {
   contentHint: "motion" | "detail" | "text";
 }
 
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+/** How much of a remote camera the viewer wants (drives the sender's per-viewer encoding). */
+export type CameraPreference = "off" | "low" | "high";
+
 export interface StreamStats {
   /** The sharer (for "recv", the remote user; for "send", selfId). */
   userId: string;
   direction: "send" | "recv";
+  /** Which video this is. Omitted = "screen" (backwards compatible). */
+  kind?: "screen" | "camera";
   /** For "send": which viewer this encoding goes to. */
   viewerId?: string;
   width?: number;
@@ -99,8 +108,18 @@ export interface VoiceCallEvents {
   localScreenEnded: Record<string, never>;
   /** Users currently receiving our screen share. */
   viewers: { userIds: string[] };
-  /** ~every 2s per active screen stream (sent or received). */
+  /** ~every 2s per active screen or camera stream (sent or received). */
   streamStats: StreamStats;
+
+  /**
+   * A remote user's camera became available (stream != null, video-only, attach to
+   * <video muted>) or went away / was turned off (null).
+   */
+  remoteCamera: { userId: string; stream: MediaStream | null };
+  /** Local camera preview (null when off). Same track that is sent; render mirrored. */
+  localCamera: { stream: MediaStream | null };
+  /** Our local camera stopped on its own (device unplugged / permission revoked). */
+  localCameraEnded: Record<string, never>;
 }
 
 export interface VoiceCall {
@@ -144,6 +163,19 @@ export interface VoiceCall {
   watchStream(userId: string, watching: boolean): void;
   /** 0..2 playback volume of a remote screen share's audio. */
   setStreamVolume(userId: string, volume: number): void;
+
+  /**
+   * Turn the camera on (getUserMedia inside the engine) and send it to every peer.
+   * Rejects on permission/device errors. No-op if already on with the same device.
+   */
+  startCamera(deviceId?: string): Promise<void>;
+  /** Turn the camera off and release the capture device (camera light goes off). */
+  stopCamera(): void;
+  isCameraOn(): boolean;
+  /** Switch camera device live (no renegotiation); remembered for the next startCamera. */
+  setCameraDevice(deviceId: string): Promise<void>;
+  /** Tell a sender how much of their camera we want. Default "high". Remembered per user. */
+  setCameraPreference(userId: string, preference: CameraPreference): void;
 
   on<K extends keyof VoiceCallEvents>(event: K, handler: (payload: VoiceCallEvents[K]) => void): () => void;
 

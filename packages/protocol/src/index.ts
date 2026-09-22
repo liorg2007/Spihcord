@@ -5,7 +5,7 @@
  */
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 // ---------------------------------------------------------------------------
 // Entities
@@ -34,6 +34,8 @@ export const VoiceStateSchema = z.object({
   deafened: z.boolean(),
   /** User is sharing their screen (viewers opt in with a `stream` signal). */
   streaming: z.boolean(),
+  /** User's camera is on (sent to everyone in the channel automatically). */
+  video: z.boolean(),
 });
 export type VoiceState = z.infer<typeof VoiceStateSchema>;
 
@@ -72,6 +74,11 @@ export const SignalDataSchema = z.union([
   z.object({
     kind: z.literal("stream"),
     action: z.enum(["watch", "unwatch"]),
+  }),
+  /** Viewer -> sender: how much of your camera I want (tile size / visibility). */
+  z.object({
+    kind: z.literal("video-pref"),
+    camera: z.enum(["off", "low", "high"]),
   }),
 ]);
 export type SignalData = z.infer<typeof SignalDataSchema>;
@@ -135,6 +142,8 @@ export const ClientMessageSchema = z.discriminatedUnion("type", [
     deafened: z.boolean(),
     /** Omitted = unchanged. */
     streaming: z.boolean().optional(),
+    /** Camera on/off. Omitted = unchanged. */
+    video: z.boolean().optional(),
   }),
   /** Relay a WebRTC signal to another user in the same voice channel. */
   z.object({ type: z.literal("rtc.signal"), to: z.string(), data: SignalDataSchema }),
