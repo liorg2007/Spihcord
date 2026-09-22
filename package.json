@@ -2,7 +2,13 @@
   "name": "shpihcord",
   "private": true,
   "version": "0.1.0",
-  "workspaces": ["packages/*", "apps/*"],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
