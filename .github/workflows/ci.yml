@@ -9,6 +9,10 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only token: CI never writes to the repo, releases or packages.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: ${{ matrix.os }}
@@ -18,20 +22,39 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      # Actions are pinned to full commit SHAs (tags can be moved); the comment
+      # names the release. Update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: 22.x
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.12.x
           cache: npm
 
-      - run: npm ci
+      # No dependency install scripts run; the few native pieces we need are
+      # set up explicitly below (supply-chain hardening, security S1/S2).
+      - run: npm ci --ignore-scripts
+
+      - name: Native modules
+        shell: bash
+        run: |
+          # Hub: compile better-sqlite3 from source instead of downloading an
+          # unhashed prebuilt binary.
+          if [ -d node_modules/better-sqlite3 ]; then npm rebuild better-sqlite3 --build-from-source; fi
+          # Electron binary (checksum-verified by @electron/get) for the e2e run.
+          node node_modules/electron/install.js
+          # uiohook-napi and koffi ship N-API prebuilds in the package: nothing to run.
 
       - name: Typecheck
         run: npm run typecheck
 
       - name: Unit tests
         run: npm test
+
+      - name: npm audit (critical/high)
+        run: npm audit --audit-level=high
 
       - name: E2E (Windows)
         if: runner.os == 'Windows'

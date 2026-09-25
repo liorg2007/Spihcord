@@ -105,12 +105,13 @@ let onStateChange: ((pressed: boolean) => void) | null = null;
 let recorder: ((binding: PttBinding | null) => void) | null = null;
 let recordTimer: NodeJS.Timeout | null = null;
 
+// Security (C3): the hook never reports keyboard input to anyone except as the
+// bound key's pressed/released state. Recording a keyboard binding happens in the
+// renderer from DOM keydown (focused window only); the recorder here only
+// accepts side mouse buttons, which some drivers don't deliver to the page.
+const RECORDABLE_MOUSE_BUTTONS = new Set([4, 5]);
+
 function handleKeyDown(e: KeyEventLike): void {
-  if (recorder) {
-    const code = uioToDom.get(e.keycode) ?? `Uiohook${e.keycode}`;
-    finishRecord({ code, label: uioToDom.has(e.keycode) ? labelFor(code) : `Key ${e.keycode}` });
-    return;
-  }
   if (target?.kind === "key" && e.keycode === target.keycode) setPressed(true);
 }
 function handleKeyUp(e: KeyEventLike): void {
@@ -119,7 +120,7 @@ function handleKeyUp(e: KeyEventLike): void {
 function handleMouseDown(e: MouseEventLike): void {
   const button = Number(e.button);
   if (recorder) {
-    const code = MOUSE_UIO_TO_DOM[button];
+    const code = RECORDABLE_MOUSE_BUTTONS.has(button) ? MOUSE_UIO_TO_DOM[button] : undefined;
     if (code) finishRecord({ code, label: labelFor(code) });
     return;
   }
@@ -174,7 +175,24 @@ export function setPttStateListener(listener: (pressed: boolean) => void): void 
   onStateChange = listener;
 }
 
+/**
+ * Rate limit for setPttBinding: re-binding key after key and watching the state
+ * would otherwise let a compromised renderer probe the keyboard. Real use is a
+ * handful of calls (settings changes, recording on/off).
+ */
+const BIND_WINDOW_MS = 60_000;
+const BIND_MAX_PER_WINDOW = 30;
+let bindCalls: number[] = [];
+
+export function allowSetBinding(now = Date.now()): boolean {
+  bindCalls = bindCalls.filter((t) => now - t < BIND_WINDOW_MS);
+  if (bindCalls.length >= BIND_MAX_PER_WINDOW) return false;
+  bindCalls.push(now);
+  return true;
+}
+
 export function setPttBinding(binding: PttBinding | null): PttRegisterResult {
+  if (binding && !allowSetBinding()) return { global: false, reason: "Too many changes; try again in a minute." };
   if (pressed) setPressed(false);
   target = null;
   if (!binding) {
@@ -206,6 +224,10 @@ function finishRecord(binding: PttBinding | null): void {
   r?.(binding);
 }
 
+/**
+ * Wait for side mouse button 4/5 via the global hook. Only call while our
+ * window is focused; index.ts cancels on blur. Keys are never recorded here.
+ */
 export function recordPttBinding(timeoutMs = 15000): Promise<PttBinding | null> {
   finishRecord(null); // cancel a previous recording
   const err = ensureHook();

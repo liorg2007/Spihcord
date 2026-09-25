@@ -40,7 +40,8 @@ export function setupAppMenu(): void {
         label: "View",
         submenu: [
           { role: "reload" },
-          { role: "toggleDevTools" },
+          // DevTools only in development builds.
+          ...(app.isPackaged ? [] : [{ role: "toggleDevTools" as const }]),
           { type: "separator" },
           { role: "resetZoom" },
           { role: "zoomIn" },

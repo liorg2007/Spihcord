@@ -106,8 +106,9 @@ export interface ShpihcordApi {
     /** Global PTT key state changes (only fires while a binding is registered). */
     onState(handler: (pressed: boolean) => void): () => void;
     /**
-     * Record the next key / mouse button pressed anywhere (global hook). Resolves
-     * with null on timeout/cancel or when the global hook is unavailable.
+     * While the window is focused, wait for side mouse button 4/5 via the global
+     * hook (keys are recorded from DOM events instead). Resolves with null on
+     * timeout, cancel, blur, or when the global hook is unavailable.
      */
     record(timeoutMs?: number): Promise<PttBinding | null>;
     cancelRecord(): void;
@@ -132,6 +133,17 @@ export interface ShpihcordApi {
      * "visible" while minimized.
      */
     onVisibility(handler: (visible: boolean) => void): () => void;
+  };
+  /** Optional so non-Electron fallbacks (renderer bridge.ts) need not implement it. */
+  net?: {
+    /**
+     * Tell main which hub we're connected to (null when logged out). Main
+     * picks the WebRTC IP handling policy from it: a public hub gets
+     * "default_public_interface_only" (no LAN/VPN/Tailscale/extra-interface
+     * addresses in ICE); a loopback/LAN/Tailscale hub gets all interfaces so
+     * direct connections on that private network keep working.
+     */
+    setHub(serverUrl: string | null): Promise<void>;
   };
   /** Optional so non-Electron fallbacks (renderer bridge.ts) need not implement it. */
   updates?: {
@@ -173,6 +185,7 @@ export const IPC = {
   screenAudioSupport: "screen:audioSupport",
   screenSelect: "screen:select",
   windowVisibility: "window:visibility",
+  netSetHub: "net:set-hub",
   updateStatus: "update:status",
   updateGetStatus: "update:get-status",
   updateInstall: "update:install",

@@ -2402,3 +2402,12 @@ h3 {
   font-weight: 700;
   text-transform: uppercase;
 }
+
+/* Cleartext (http) server confirmation on the login screen. */
+.insecure-confirm { line-height: 1.4; }
+.insecure-actions { display: flex; gap: 8px; margin-top: 8px; }
+
+/* Settings -> My Account: session / password actions. */
+.account-actions,
+.account-confirm { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.change-password { max-width: 420px; }

@@ -1,5 +1,14 @@
 import { useState, type FormEvent } from "react";
-import { ApiError, DEFAULT_SERVER_URL, login, normalizeServerUrl, register } from "../lib/api";
+import {
+  allowCleartext,
+  ApiError,
+  CLEARTEXT_WARNING,
+  DEFAULT_SERVER_URL,
+  isConnectionAllowed,
+  login,
+  normalizeServerUrl,
+  register,
+} from "../lib/api";
 import { getLastLogin, loginWith } from "../lib/session";
 import { useApp } from "../store/app";
 import { LogoMark } from "./Icons";
@@ -14,11 +23,13 @@ export function LoginScreen() {
   const [inviteCode, setInviteCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Normalized http:// URL of a public host awaiting the user's cleartext confirmation. */
+  const [confirmCleartext, setConfirmCleartext] = useState<string | null>(null);
 
   const isRegister = mode === "register";
 
-  async function submit(e: FormEvent) {
-    e.preventDefault();
+  async function submit(e: FormEvent | null, acceptedCleartext = false) {
+    e?.preventDefault();
     if (busy) return;
     setError(null);
     let url: string;
@@ -28,6 +39,12 @@ export function LoginScreen() {
       setError(err instanceof Error ? err.message : String(err));
       return;
     }
+    if (acceptedCleartext && confirmCleartext === url) allowCleartext(url);
+    if (!isConnectionAllowed(url)) {
+      setConfirmCleartext(url);
+      return;
+    }
+    setConfirmCleartext(null);
     const name = username.trim();
     if (!name) return setError("Enter your username.");
     if (!password) return setError("Enter your password.");
@@ -80,7 +97,10 @@ export function LoginScreen() {
           <span className="field-label">Server address</span>
           <input
             value={serverUrl}
-            onChange={(e) => setServerUrl(e.target.value)}
+            onChange={(e) => {
+              setServerUrl(e.target.value);
+              setConfirmCleartext(null);
+            }}
             placeholder={DEFAULT_SERVER_URL}
             spellCheck={false}
             autoComplete="url"
@@ -111,6 +131,21 @@ export function LoginScreen() {
             <span className="field-label">Invite code</span>
             <input value={inviteCode} onChange={(e) => setInviteCode(e.target.value)} spellCheck={false} />
           </label>
+        )}
+
+        {confirmCleartext && (
+          <div className="form-error insecure-confirm" role="alert">
+            <strong>{CLEARTEXT_WARNING}</strong> Anyone on the network path to {confirmCleartext} can read it and take
+            over your account. Use https:// if the server supports it.
+            <div className="insecure-actions">
+              <button type="button" className="btn btn-danger btn-small" onClick={() => void submit(null, true)}>
+                Connect anyway
+              </button>
+              <button type="button" className="btn btn-secondary btn-small" onClick={() => setConfirmCleartext(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
         )}
 
         {error && (

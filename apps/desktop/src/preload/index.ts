@@ -46,6 +46,9 @@ const api: ShpihcordApi = {
       };
     },
   },
+  net: {
+    setHub: (serverUrl: string | null) => ipcRenderer.invoke(IPC.netSetHub, typeof serverUrl === "string" ? serverUrl : null),
+  },
   updates: {
     getStatus: () => ipcRenderer.invoke(IPC.updateGetStatus),
     onStatus: (handler: (status: UpdateStatus) => void) => {

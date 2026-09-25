@@ -28,9 +28,16 @@ async function osAllows(kinds: MediaKind[]): Promise<boolean> {
   return true;
 }
 
-export function setupPermissions(ses: Session): void {
-  ses.setPermissionRequestHandler((_wc, permission, callback, details) => {
-    if (permission !== "media") {
+/**
+ * `isAppPage(wc, url)`: true only for our own main window showing our own
+ * bundled page (origin scoping; any other webContents / origin is denied).
+ */
+export function setupPermissions(
+  ses: Session,
+  isAppPage: (wc: Electron.WebContents | null, url: string | undefined) => boolean,
+): void {
+  ses.setPermissionRequestHandler((wc, permission, callback, details) => {
+    if (!isAppPage(wc, details.requestingUrl) || permission !== "media") {
       callback(false);
       return;
     }
@@ -42,7 +49,8 @@ export function setupPermissions(ses: Session): void {
     }
     void osAllows(types as MediaKind[]).then(callback, () => callback(false));
   });
-  ses.setPermissionCheckHandler((_wc, permission, _origin, details) => {
+  ses.setPermissionCheckHandler((wc, permission, _origin, details) => {
+    if (!isAppPage(wc, details.requestingUrl)) return false;
     const p = permission as string;
     if (p === "speaker-selection") return true;
     if (p !== "media") return false;

@@ -6,19 +6,62 @@
  *   "Update ready - restart"; the renderer calls updates.install() to apply.
  *   If the user never clicks, the update is installed on the next quit.
  * - Disabled when not packaged (dev) or with SHPIHCORD_DISABLE_UPDATES=1.
+ * - Every downloaded update must match an Ed25519-signed manifest before it
+ *   can be installed (updateSignature.ts); otherwise it's never installed.
  * - Unsigned macOS builds can't be updated by Squirrel.Mac, so there we only
  *   report { state: "available-manual", url } pointing at the release page.
  */
-import { app, BrowserWindow, ipcMain, type IpcMainEvent, type IpcMainInvokeEvent } from "electron";
+import { app, BrowserWindow, ipcMain, net, type IpcMainEvent, type IpcMainInvokeEvent } from "electron";
 import { execFile } from "node:child_process";
 import electronUpdater from "electron-updater";
 import { IPC, type UpdateStatus } from "../shared/ipc";
+import { UPDATE_PUBLIC_KEY_PEM } from "./updatePublicKey";
+import { manifestCovers, manifestName, sha512File, verifyManifestSignature } from "./updateSignature";
 
 const { autoUpdater } = electronUpdater;
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const RELEASES_URL = "https://github.com/liorg2007/Spihcord/releases";
 
 let status: UpdateStatus | null = null;
+/** Version whose downloaded file passed the signed-manifest check (security C2). */
+let verifiedVersion: string | null = null;
+
+async function fetchBytes(url: string): Promise<Buffer> {
+  const res = await net.fetch(url, { redirect: "follow" });
+  if (!res.ok) throw new Error(`${res.status} fetching ${url}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > 1024 * 1024) throw new Error(`${url} is unexpectedly large`);
+  return buf;
+}
+
+/**
+ * Check a downloaded update against the Ed25519-signed manifest of its
+ * release. Resolves true only if the signature is valid for the embedded key
+ * and the signed manifest names this version and the downloaded file's sha512.
+ */
+async function verifyDownloadedUpdate(version: string, downloadedFile: string): Promise<boolean> {
+  const name = manifestName(process.platform, process.arch);
+  const base = `${RELEASES_URL}/download/v${encodeURIComponent(version)}`;
+  try {
+    const [manifest, sig, actual] = await Promise.all([
+      fetchBytes(`${base}/${name}`),
+      fetchBytes(`${base}/${name}.sig`),
+      sha512File(downloadedFile),
+    ]);
+    if (!verifyManifestSignature(manifest, sig.toString("utf8"), UPDATE_PUBLIC_KEY_PEM)) {
+      console.error(`[updater] ${name} signature is INVALID for v${version}; refusing to install`);
+      return false;
+    }
+    if (!manifestCovers(manifest.toString("utf8"), version, actual)) {
+      console.error(`[updater] downloaded file doesn't match the signed ${name} for v${version}; refusing to install`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("[updater] couldn't verify the update signature; refusing to install:", err instanceof Error ? err.message : err);
+    return false;
+  }
+}
 
 /** True if the running .app has a real (Developer ID) signature, not ad-hoc/none. */
 function isMacSigned(): Promise<boolean> {
@@ -36,7 +79,7 @@ function isMacSigned(): Promise<boolean> {
 export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
   const fromOurWindow = (e: IpcMainEvent | IpcMainInvokeEvent): boolean => {
     const win = getWindow();
-    return !!win && !win.isDestroyed() && e.sender === win.webContents;
+    return !!win && !win.isDestroyed() && e.sender === win.webContents && e.senderFrame === win.webContents.mainFrame;
   };
   const publish = (next: UpdateStatus): void => {
     status = next;
@@ -46,7 +89,7 @@ export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
 
   ipcMain.handle(IPC.updateGetStatus, (e) => (fromOurWindow(e) ? status : null));
   ipcMain.on(IPC.updateInstall, (e) => {
-    if (fromOurWindow(e) && status?.state === "ready") {
+    if (fromOurWindow(e) && status?.state === "ready" && verifiedVersion === status.version) {
       // isSilent=true (Windows: no installer UI), isForceRunAfter=true (relaunch).
       setImmediate(() => autoUpdater.quitAndInstall(true, true));
     }
@@ -60,7 +103,8 @@ export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
     const manualOnly = process.platform === "darwin" && !(await isMacSigned());
 
     autoUpdater.autoDownload = !manualOnly;
-    autoUpdater.autoInstallOnAppQuit = true;
+    // Only after the signed-manifest check passes (see update-downloaded).
+    autoUpdater.autoInstallOnAppQuit = false;
     autoUpdater.logger = console;
 
     autoUpdater.on("update-available", (info) => {
@@ -72,7 +116,19 @@ export function setupAutoUpdater(getWindow: () => BrowserWindow | null): void {
       const version = status && "version" in status ? status.version : "";
       publish({ state: "downloading", version, percent: Math.round(p.percent) });
     });
-    autoUpdater.on("update-downloaded", (info) => publish({ state: "ready", version: info.version }));
+    autoUpdater.on("update-downloaded", (event) => {
+      void verifyDownloadedUpdate(event.version, event.downloadedFile).then((ok) => {
+        if (!ok) {
+          verifiedVersion = null;
+          autoUpdater.autoInstallOnAppQuit = false;
+          status = null;
+          return;
+        }
+        verifiedVersion = event.version;
+        autoUpdater.autoInstallOnAppQuit = true;
+        publish({ state: "ready", version: event.version });
+      });
+    });
     autoUpdater.on("error", (err) => console.warn("[updater]", err?.message ?? err));
 
     const check = (): void => {

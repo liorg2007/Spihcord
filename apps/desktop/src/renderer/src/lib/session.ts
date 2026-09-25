@@ -1,6 +1,7 @@
 /** Session lifecycle: restore/login/logout and the hub connection. */
 import type { StoredSession } from "../../../shared/ipc";
 import { applyServerMessage, getApp, resetSessionState, setApp, toast } from "../store/app";
+import { changePassword as apiChangePassword, isConnectionAllowed, logoutRemote, revokeAllSessions } from "./api";
 import { bridge } from "./bridge";
 import { HubClient } from "./hub";
 import { attachHub, handleHubDisconnected, handleServerMessage, leaveVoice } from "./voice";
@@ -33,6 +34,7 @@ function rememberLogin(session: StoredSession): void {
 }
 
 function stopHub(): void {
+  void bridge.net?.setHub(null).catch(() => {});
   attachHub(null);
   hub?.stop();
   hub = null;
@@ -41,6 +43,8 @@ function stopHub(): void {
 function startSession(session: StoredSession): void {
   stopHub();
   resetSessionState({ screen: "app", session, connection: "connecting" });
+  // Main picks the WebRTC IP policy from the hub's address (security T2).
+  void bridge.net?.setHub(session.serverUrl).catch(() => {});
   const h = new HubClient(session.serverUrl, session.token);
   hub = h;
   attachHub(h);
@@ -60,7 +64,9 @@ function startSession(session: StoredSession): void {
     if (hub !== h) return;
     leaveVoice({ silent: true, notifyHub: false });
     if (fatal.kind === "unauthorized") {
-      void logout("Your session has expired. Please log in again.");
+      void logout("Your session has expired. Please log in again.", { remote: false });
+    } else if (fatal.kind === "insecure") {
+      void logout(fatal.message, { remote: false });
     } else {
       setApp({ fatal });
     }
@@ -78,6 +84,12 @@ export async function bootstrap(): Promise<void> {
     saved = await bridge.session.load();
   } catch (err) {
     console.warn("[session] load failed", err);
+  }
+  if (saved && !isConnectionAllowed(saved.serverUrl)) {
+    // Saved before the https policy (or the confirmation was cleared): don't
+    // send the token in plain text; ask again on the login screen.
+    await logout("This server isn't encrypted. Log in again to confirm the connection.", { remote: false });
+    return;
   }
   if (saved) startSession(saved);
   else setApp({ screen: "login" });
@@ -99,9 +111,16 @@ export async function loginWith(session: StoredSession): Promise<void> {
   }
 }
 
-export async function logout(notice?: string): Promise<void> {
+export async function logout(notice?: string, opts: { remote?: boolean } = {}): Promise<void> {
+  const session = getApp().session;
   leaveVoice({ silent: true });
   stopHub();
+  if (session && opts.remote !== false) {
+    // Revoke the token on the hub too (best effort: offline / older hubs just keep it until expiry).
+    await logoutRemote(session.serverUrl, session.token).catch((err: unknown) =>
+      console.warn("[session] remote logout failed", err instanceof Error ? err.message : err),
+    );
+  }
   try {
     await bridge.session.clear();
   } catch {
@@ -118,4 +137,27 @@ export function reconnectHere(): void {
 
 export function reconnectNow(): void {
   hub?.reconnectNow();
+}
+
+/** Revoke every session of this account on the hub, then log out here. Throws on failure. */
+export async function logoutAllDevices(): Promise<void> {
+  const session = getApp().session;
+  if (!session) return;
+  await revokeAllSessions(session.serverUrl, session.token);
+  await logout("You were logged out on all devices.", { remote: false });
+}
+
+/**
+ * Change the password. If the hub returns a new token for this device, keep
+ * going with it; otherwise (it revoked everything) log in again.
+ */
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  const session = getApp().session;
+  if (!session) return;
+  const res = await apiChangePassword(session.serverUrl, session.token, currentPassword, newPassword);
+  if (res) {
+    await loginWith({ serverUrl: session.serverUrl, token: res.token, user: res.user });
+  } else {
+    await logout("Password changed. Log in with your new password.", { remote: false });
+  }
 }

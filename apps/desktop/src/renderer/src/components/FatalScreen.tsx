@@ -17,6 +17,11 @@ export function FatalScreen({ fatal }: { fatal: HubFatal }) {
             : "Your account signed in from another window or device, so this one was disconnected."}
         </p>
         {fatal.message && <p className="fatal-detail">{fatal.message}</p>}
+        {!outdated && (
+          <p className="muted">
+            Not you? Log in again, then use Settings → My Account → “Log out all devices” and change your password.
+          </p>
+        )}
         <div className="fatal-actions">
           {!outdated && (
             <button className="btn btn-primary" onClick={reconnectHere}>

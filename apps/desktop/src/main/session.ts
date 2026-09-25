@@ -14,9 +14,19 @@ import type { SessionSaveResult, StoredSession } from "../shared/ipc";
 const sessionFile = (): string => join(app.getPath("userData"), "session.bin");
 const plainFile = (): string => join(app.getPath("userData"), "session.json");
 
+/**
+ * Real OS-backed encryption only. On Linux, safeStorage "works" with the
+ * `basic_text` backend when no keyring is found, but that key is a hard-coded
+ * constant (obfuscation, not encryption), so treat it as unavailable.
+ */
 function encryptionAvailable(): boolean {
   try {
-    return safeStorage.isEncryptionAvailable();
+    if (!safeStorage.isEncryptionAvailable()) return false;
+    if (process.platform === "linux") {
+      const backend = safeStorage.getSelectedStorageBackend();
+      if (backend === "basic_text" || backend === "unknown") return false;
+    }
+    return true;
   } catch {
     return false;
   }

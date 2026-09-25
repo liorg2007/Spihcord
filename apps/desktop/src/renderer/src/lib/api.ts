@@ -1,5 +1,12 @@
 import { AuthResponseSchema, ErrorResponseSchema, type AuthResponse } from "@shpihcord/protocol";
 
+import {
+  needsCleartextConsent,
+  normalizeServerUrl as normalize,
+  serverOrigin,
+  ServerUrlError,
+} from "../../../shared/serverUrl";
+
 export const DEFAULT_SERVER_URL = "http://localhost:8420";
 
 export class ApiError extends Error {
@@ -12,23 +19,53 @@ export class ApiError extends Error {
   }
 }
 
-/** Accepts "host:port", "https://host/", etc. and returns "scheme://host[:port][/path]" without trailing slash. */
+/** Accepts "host:port", "https://host/", etc. (see shared/serverUrl.ts). Bare public hosts get https://. */
 export function normalizeServerUrl(input: string): string {
-  let s = input.trim();
-  if (!s) throw new ApiError("invalid_url", "Enter a server address.");
-  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `http://${s}`;
-  let url: URL;
   try {
-    url = new URL(s);
+    return normalize(input);
+  } catch (err) {
+    throw new ApiError("invalid_url", err instanceof ServerUrlError ? err.message : String(err));
+  }
+}
+
+// --- cleartext consent (security T1) ------------------------------------------
+
+const CLEARTEXT_OK_KEY = "shpihcord.cleartextAllowed";
+
+function loadCleartextAllowed(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(CLEARTEXT_OK_KEY) ?? "[]") as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
   } catch {
-    throw new ApiError("invalid_url", "That server address doesn't look right.");
+    return [];
   }
-  if (url.protocol === "ws:") url.protocol = "http:";
-  if (url.protocol === "wss:") url.protocol = "https:";
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new ApiError("invalid_url", "Server address must start with http:// or https://");
+}
+
+/** Remember that the user accepted an unencrypted connection to this server. */
+export function allowCleartext(serverUrl: string): void {
+  const origin = serverOrigin(serverUrl);
+  const list = loadCleartextAllowed();
+  if (list.includes(origin)) return;
+  try {
+    localStorage.setItem(CLEARTEXT_OK_KEY, JSON.stringify([...list, origin].slice(-50)));
+  } catch {
+    /* ignore */
   }
-  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+}
+
+/**
+ * True if we may talk to this server: https, a local/LAN/Tailscale host, or an
+ * http server the user explicitly accepted before.
+ */
+export function isConnectionAllowed(serverUrl: string): boolean {
+  return !needsCleartextConsent(serverUrl) || loadCleartextAllowed().includes(serverOrigin(serverUrl));
+}
+
+export const CLEARTEXT_WARNING =
+  "This server is not encrypted — your password will be sent in plain text.";
+
+function assertAllowed(serverUrl: string): void {
+  if (!isConnectionAllowed(serverUrl)) throw new ApiError("insecure_url", CLEARTEXT_WARNING);
 }
 
 export function toWsUrl(serverUrl: string): string {
@@ -40,14 +77,17 @@ export function toWsUrl(serverUrl: string): string {
   return url.toString();
 }
 
-async function post(serverUrl: string, path: string, body: unknown): Promise<AuthResponse> {
+async function request(serverUrl: string, path: string, body: unknown, token?: string): Promise<unknown> {
+  assertAllowed(serverUrl);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (token) headers["authorization"] = `Bearer ${token}`;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15000);
   let res: Response;
   try {
     res = await fetch(`${serverUrl}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
@@ -67,7 +107,11 @@ async function post(serverUrl: string, path: string, body: unknown): Promise<Aut
     if (err.success) throw new ApiError(err.data.error, err.data.message);
     throw new ApiError(`http_${res.status}`, `Server returned ${res.status} ${res.statusText}`.trim());
   }
-  const parsed = AuthResponseSchema.safeParse(json);
+  return json;
+}
+
+async function post(serverUrl: string, path: string, body: unknown): Promise<AuthResponse> {
+  const parsed = AuthResponseSchema.safeParse(await request(serverUrl, path, body));
   if (!parsed.success) throw new ApiError("bad_response", "The server sent an unexpected response. Is this a Shpihcord hub?");
   return parsed.data;
 }
@@ -78,4 +122,31 @@ export function login(serverUrl: string, username: string, password: string): Pr
 
 export function register(serverUrl: string, username: string, password: string, inviteCode: string): Promise<AuthResponse> {
   return post(serverUrl, "/api/register", { username, password, inviteCode });
+}
+
+// --- session management (security H1) ------------------------------------------
+
+/** Revoke this device's token on the hub. Best effort: callers still clear local state. */
+export async function logoutRemote(serverUrl: string, token: string): Promise<void> {
+  await request(serverUrl, "/api/logout", {}, token);
+}
+
+/** Revoke every token of this account (all devices, including this one). */
+export async function revokeAllSessions(serverUrl: string, token: string): Promise<void> {
+  await request(serverUrl, "/api/sessions/revoke-all", {}, token);
+}
+
+/**
+ * Change the password. The hub revokes the other sessions; if it hands back a
+ * fresh token for this device it is returned so the caller can keep going.
+ */
+export async function changePassword(
+  serverUrl: string,
+  token: string,
+  currentPassword: string,
+  newPassword: string,
+): Promise<AuthResponse | null> {
+  const json = await request(serverUrl, "/api/password", { currentPassword, newPassword }, token);
+  const parsed = AuthResponseSchema.safeParse(json);
+  return parsed.success ? parsed.data : null;
 }

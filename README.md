@@ -152,7 +152,31 @@ See [PLAN.md](PLAN.md) for the design.
 4. Check the draft on GitHub and click **Publish release**. Installed apps pick it up
    within 6 hours, or on their next start.
 
-Optional repository secrets, used for signing when they are set:
+#### Release security (do this once)
+
+Anyone who can publish a GitHub Release can otherwise push code to every installed app, so:
+
+1. **2FA:** turn on two-factor authentication for every account with write access
+   (Settings → Password and authentication), and require it for the organisation if there is one.
+2. **Branch protection:** Settings → Branches → add a rule (or ruleset) for `main`: require a pull
+   request and passing **CI** checks, block force pushes and deletion. Add a tag ruleset for
+   `v*` so that only maintainers can create release tags.
+3. **Protected `release` environment:** Settings → Environments → **New environment** `release`:
+   - **Required reviewers:** yourself (every release run waits for your approval);
+   - **Deployment branches and tags:** "Selected" → tag pattern `v*`;
+   - add the environment secret **`UPDATE_SIGNING_KEY`** (below) and the signing secrets from the table.
+   The desktop release job only runs in this environment, and it only creates **draft** releases.
+4. **Update-signing key:** `node apps/desktop/scripts/gen-update-key.mjs` creates an Ed25519 keypair.
+   It writes the private key to `~/.shpihcord/update-signing-key.pem`, outside the repo, and embeds the
+   public key in `apps/desktop/src/main/updatePublicKey.ts` (commit that file). Paste the whole PEM
+   file into the `UPDATE_SIGNING_KEY` secret and keep an offline backup. The release job signs every
+   `latest*.yml` update manifest and uploads a `.sig` next to it. The app installs an update only
+   if that signature verifies with the embedded key and the signed manifest lists the SHA-512 of the
+   downloaded file. If you lose the key, users must install the next version by hand.
+   Never commit the private key.
+
+Optional environment secrets, used for code signing when they are set (once a Windows
+certificate exists, also set `win.signtoolOptions.publisherName` in `electron-builder.yml`):
 
 | Secret | Purpose |
 |---|---|

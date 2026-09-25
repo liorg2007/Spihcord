@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { PttBinding } from "../../../shared/ipc";
 import { bridge } from "../lib/bridge";
 import { hostOf } from "../lib/format";
 import { startMicTest } from "../lib/micTest";
 import { bindingFromKeyboardEvent, bindingFromMouseEvent, refreshPtt, setPttRecording } from "../lib/ptt";
 import { useCaps } from "../lib/platform";
-import { logout } from "../lib/session";
+import { changePassword, logout, logoutAllDevices } from "../lib/session";
+import { ApiError } from "../lib/api";
 import { setApp, useApp } from "../store/app";
 import { StreamVideo } from "./Stream";
 import { useSettings, type Settings } from "../store/settings";
@@ -94,10 +95,136 @@ function AccountSettings() {
           </div>
         </div>
       </div>
-      <button className="btn btn-danger" onClick={() => void logout()}>
-        Log Out
-      </button>
+      <ChangePassword />
+      <div className="settings-divider" />
+      <h3 className="settings-subtitle">Sessions</h3>
+      <p className="settings-hint">
+        “Log out all devices” signs this account out everywhere, including any device that might have your login.
+      </p>
+      <div className="account-actions">
+        <button className="btn btn-danger" onClick={() => void logout()}>
+          Log Out
+        </button>
+        <LogoutAllButton />
+      </div>
     </section>
+  );
+}
+
+function accountErrorText(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.code === "invalid_credentials" || err.code === "wrong_password") return "Your current password is wrong.";
+    if (err.code === "rate_limited") return "Too many attempts. Wait a moment and try again.";
+    if (err.code === "http_404") return "This server doesn't support that yet. Ask the admin to update the hub.";
+    return err.message;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+function LogoutAllButton() {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const run = () => {
+    setBusy(true);
+    setError(null);
+    logoutAllDevices().catch((err: unknown) => {
+      setError(accountErrorText(err));
+      setBusy(false);
+    });
+  };
+  return (
+    <>
+      {confirming ? (
+        <span className="account-confirm">
+          <button className="btn btn-danger" disabled={busy} onClick={run}>
+            {busy ? <span className="spinner" /> : "Yes, log out everywhere"}
+          </button>
+          <button className="btn btn-secondary" disabled={busy} onClick={() => setConfirming(false)}>
+            Cancel
+          </button>
+        </span>
+      ) : (
+        <button className="btn btn-secondary" onClick={() => setConfirming(true)}>
+          Log out all devices
+        </button>
+      )}
+      {error && (
+        <div className="form-error" role="alert">
+          {error}
+        </div>
+      )}
+    </>
+  );
+}
+
+function ChangePassword() {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    if (busy) return;
+    setError(null);
+    if (!current) return setError("Enter your current password.");
+    if (next.length < 8) return setError("New passwords need at least 8 characters.");
+    if (next.length > 128) return setError("New passwords can be at most 128 characters.");
+    if (next !== confirm) return setError("The new passwords don't match.");
+    setBusy(true);
+    changePassword(current, next).catch((err: unknown) => {
+      setError(accountErrorText(err));
+      setBusy(false);
+    });
+  };
+
+  if (!open) {
+    return (
+      <>
+        <div className="settings-divider" />
+        <h3 className="settings-subtitle">Password</h3>
+        <button className="btn btn-secondary" onClick={() => setOpen(true)}>
+          Change password
+        </button>
+      </>
+    );
+  }
+  return (
+    <>
+      <div className="settings-divider" />
+      <h3 className="settings-subtitle">Password</h3>
+      <form className="change-password" onSubmit={submit} noValidate>
+        <label className="field">
+          <span className="field-label">Current password</span>
+          <input type="password" value={current} onChange={(e) => setCurrent(e.target.value)} autoComplete="current-password" autoFocus />
+        </label>
+        <label className="field">
+          <span className="field-label">New password</span>
+          <input type="password" value={next} onChange={(e) => setNext(e.target.value)} autoComplete="new-password" />
+        </label>
+        <label className="field">
+          <span className="field-label">Confirm new password</span>
+          <input type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+        </label>
+        <p className="settings-hint">Changing your password logs out your other devices.</p>
+        {error && (
+          <div className="form-error" role="alert">
+            {error}
+          </div>
+        )}
+        <div className="account-actions">
+          <button className="btn btn-primary" type="submit" disabled={busy}>
+            {busy ? <span className="spinner" /> : "Change password"}
+          </button>
+          <button className="btn btn-secondary" type="button" disabled={busy} onClick={() => setOpen(false)}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </>
   );
 }
 
@@ -305,8 +432,8 @@ function VoiceSettings() {
         <ShieldIcon size={16} /> Privacy
       </h3>
       <Toggle
-        title="Hide my IP (force relay)"
-        description="Route voice through the server's TURN relay so friends can't see your IP address. May add latency. Applies the next time you join."
+        title="Hide my IP from friends (uses relay)"
+        description="Route voice, video and screen share through the server's TURN relay so friends never see your IP address. Without it, direct connections show friends your public IP (local network and VPN addresses are always hidden). May add latency. Applies the next time you join."
         checked={s.forceRelay}
         onChange={(v) => update({ forceRelay: v })}
       />
@@ -441,12 +568,13 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
     };
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("mousedown", onMouse, true);
-    // Also listen system-wide, so keys the window can't see (e.g. while unfocused) work too.
+    // Keys are recorded from DOM events in this (focused) window only. The global
+    // hook is used during recording just for side mouse buttons 4/5, which some
+    // mice/drivers never deliver to the page; main only arms it while focused.
+    const onBlur = () => finish(null);
+    window.addEventListener("blur", onBlur);
     void bridge.ptt.record(15000).then((b) => {
       if (b) finish(b);
-      // Global recorder timed out (it resolves null at once if the hook can't start,
-      // e.g. macOS without Accessibility; then keep recording in-window).
-      else if (!done && globalAvailable && axStatus !== "denied") finish(null);
     });
     const timeout = setTimeout(() => finish(null), 15000);
     return () => {
@@ -454,6 +582,7 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
       clearTimeout(timeout);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("mousedown", onMouse, true);
+      window.removeEventListener("blur", onBlur);
       bridge.ptt.cancelRecord();
       delete document.body.dataset.recordingKeybind;
       setPttRecording(false);

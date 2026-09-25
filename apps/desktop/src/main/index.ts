@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, shell, Tray, type IpcMainInvokeEvent } from "electron";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { IPC } from "../shared/ipc";
 import { clearSession, loadSession, saveSession } from "./session";
 import {
@@ -14,6 +15,8 @@ import { setupPermissions } from "./permissions";
 import { setupAutoUpdater } from "./updater";
 import { applyEarlySwitches, setupAppMenu, setupPlatformIpc, trayImage } from "./platformSetup";
 import { getAudioSupport, getSources, selectSource, setupDisplayMediaHandler } from "./screen";
+import { webrtcPolicyForHub } from "./webrtcPolicy";
+import { runSelfTestIfRequested } from "./selfTest";
 
 const BG = "#1e1f22";
 let mainWindow: BrowserWindow | null = null;
@@ -23,7 +26,9 @@ let quitting = false;
 
 applyEarlySwitches();
 
-if (!app.requestSingleInstanceLock()) {
+if (runSelfTestIfRequested()) {
+  // Headless smoke test (see selfTest.ts): no window, no single-instance lock.
+} else if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
   app.on("second-instance", () => showWindow());
@@ -37,6 +42,28 @@ function isHttpUrl(url: string): boolean {
   } catch {
     return false;
   }
+}
+
+const RENDERER_FILE_URL = pathToFileURL(join(__dirname, "../renderer/index.html")).href;
+const DEV_URL = !app.isPackaged ? process.env["ELECTRON_RENDERER_URL"] : undefined;
+
+/** True for our own bundled renderer page (or the dev server in development). */
+function isAppUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    if (DEV_URL) return u.origin === new URL(DEV_URL).origin;
+    u.hash = "";
+    u.search = "";
+    return u.href === RENDERER_FILE_URL;
+  } catch {
+    return false;
+  }
+}
+
+/** Permission scoping: only our main window, only while it shows our page. */
+function isAppPage(wc: Electron.WebContents | null, url: string | undefined): boolean {
+  return !!wc && !!mainWindow && wc === mainWindow.webContents && isAppUrl(url ?? wc.getURL());
 }
 
 /** The logo bubble at `size` px, from the PNGs `npm run icons` writes to resources/. */
@@ -79,8 +106,13 @@ function createWindow(): void {
       // and the engine's VAD timers must keep running while minimized.
       autoplayPolicy: "no-user-gesture-required",
       backgroundThrottling: false,
+      // No DevTools in packaged builds (the macOS View menu omits it too).
+      devTools: !app.isPackaged,
     },
   });
+  // Security T2: never expose LAN / VPN / Tailscale / extra-interface addresses
+  // in ICE until we know the hub is on a private network (net:set-hub).
+  mainWindow.webContents.setWebRTCIPHandlingPolicy(webrtcPolicyForHub(null));
 
   mainWindow.once("ready-to-show", () => mainWindow?.show());
   // backgroundThrottling=false keeps document.visibilityState "visible" while
@@ -94,6 +126,8 @@ function createWindow(): void {
   win.on("restore", sendVisibility);
   win.on("hide", sendVisibility);
   win.on("show", sendVisibility);
+  // A push-to-talk recording must never outlive focus (security C3).
+  win.on("blur", () => cancelPttRecord());
   win.on("close", (event) => {
     if (process.platform === "darwin" && !quitting) {
       event.preventDefault();
@@ -117,9 +151,8 @@ function createWindow(): void {
     }
   });
 
-  const devUrl = process.env["ELECTRON_RENDERER_URL"];
-  if (!app.isPackaged && devUrl) {
-    void mainWindow.loadURL(devUrl);
+  if (DEV_URL) {
+    void mainWindow.loadURL(DEV_URL);
   } else {
     void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
@@ -163,9 +196,11 @@ function setupIpc(): void {
     if (typeof b.code !== "string" || typeof b.label !== "string") return { global: false, reason: "invalid binding" };
     return setPttBinding({ code: b.code, label: b.label });
   });
-  ipcMain.handle(IPC.pttRecord, (e, timeoutMs: unknown) =>
-    trusted(e) ? recordPttBinding(typeof timeoutMs === "number" ? timeoutMs : undefined) : null,
-  );
+  ipcMain.handle(IPC.pttRecord, (e, timeoutMs: unknown) => {
+    // Only while our window is focused (blur cancels, see createWindow).
+    if (!trusted(e) || !mainWindow?.isFocused()) return null;
+    return recordPttBinding(typeof timeoutMs === "number" ? timeoutMs : undefined);
+  });
   ipcMain.on(IPC.pttCancelRecord, (e) => {
     if (trusted(e)) cancelPttRecord();
   });
@@ -183,6 +218,11 @@ function setupIpc(): void {
 
   setupPlatformIpc(trusted);
 
+  ipcMain.handle(IPC.netSetHub, (e, serverUrl: unknown) => {
+    if (!trusted(e) || !mainWindow) return;
+    mainWindow.webContents.setWebRTCIPHandlingPolicy(webrtcPolicyForHub(typeof serverUrl === "string" ? serverUrl : null));
+  });
+
   setPttStateListener((pressed) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.pttState, pressed);
   });
@@ -191,7 +231,7 @@ function setupIpc(): void {
 function onReady(): void {
   if (process.platform === "win32") app.setAppUserModelId("app.shpihcord.desktop");
   setupAppMenu();
-  setupPermissions(session.defaultSession);
+  setupPermissions(session.defaultSession, isAppPage);
   setupIpc();
   createWindow();
   createTray();

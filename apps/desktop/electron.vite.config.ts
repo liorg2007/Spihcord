@@ -10,14 +10,15 @@ import type { Plugin } from "vite";
 function cspPlugin(dev: boolean): Plugin {
   const directives = [
     "default-src 'self'",
-    // blob: + wasm-unsafe-eval leave room for AudioWorklets / RNNoise WASM in the call engine.
-    `script-src 'self' blob: 'wasm-unsafe-eval'${dev ? " 'unsafe-inline' 'unsafe-eval'" : ""}`,
+    // No blob: scripts (nothing builds code at runtime); wasm-unsafe-eval stays for WASM DSP.
+    `script-src 'self' 'wasm-unsafe-eval'${dev ? " 'unsafe-inline' 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: http: https:",
+    // Images are bundled assets or data: URLs made by main (screen thumbnails, app icons).
+    "img-src 'self' data:",
     "font-src 'self' data:",
     "connect-src 'self' http: https: ws: wss:",
     "media-src 'self' blob: mediastream:",
-    "worker-src 'self' blob:",
+    "worker-src 'self'",
     "object-src 'none'",
     "base-uri 'none'",
     "form-action 'none'",

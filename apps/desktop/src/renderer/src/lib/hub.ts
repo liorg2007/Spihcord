@@ -9,7 +9,7 @@ import {
   type ServerMessage,
   type ServerMessageOf,
 } from "@shpihcord/protocol";
-import { toWsUrl } from "./api";
+import { isConnectionAllowed, toWsUrl } from "./api";
 
 export type HubStatus = "connecting" | "connected" | "reconnecting" | "stopped";
 
@@ -17,7 +17,9 @@ export type HubStatus = "connecting" | "connected" | "reconnecting" | "stopped";
 export type HubFatal =
   | { kind: "unauthorized"; message: string }
   | { kind: "outdated"; message: string }
-  | { kind: "replaced"; message: string };
+  | { kind: "replaced"; message: string }
+  /** Plain http/ws to a public host that the user never accepted (security T1). */
+  | { kind: "insecure"; message: string };
 
 const FATAL_CODES: Record<string, HubFatal["kind"]> = {
   unauthorized: "unauthorized",
@@ -45,6 +47,8 @@ const FATAL_CLOSE_CODES: Record<number, HubFatal> = {
 const BACKOFF_BASE_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
 const HANDSHAKE_TIMEOUT_MS = 15000;
+/** Frames above this are dropped unparsed (a hostile hub could otherwise stall the UI). */
+const MAX_FRAME_CHARS = 4 * 1024 * 1024;
 /** Hub pings every 25s; if nothing arrives for this long, assume the socket is dead. */
 const IDLE_TIMEOUT_MS = 65000;
 
@@ -173,6 +177,12 @@ export class HubClient {
 
   private open(): void {
     if (this.stopped) return;
+    if (!isConnectionAllowed(this.serverUrl)) {
+      // Never send the token over cleartext to a host the user didn't accept.
+      this.stop();
+      this.emit("fatal", { kind: "insecure", message: "This server isn't encrypted. Log in again to confirm the connection." });
+      return;
+    }
     this.setStatus(this.attempt === 0 ? "connecting" : "reconnecting");
     let ws: WebSocket;
     try {
@@ -212,6 +222,10 @@ export class HubClient {
   private handleFrame(raw: unknown): void {
     this.bumpIdle();
     if (typeof raw !== "string") return;
+    if (raw.length > MAX_FRAME_CHARS) {
+      console.warn(`[hub] oversized frame dropped (${raw.length} chars)`);
+      return;
+    }
     let json: unknown;
     try {
       json = JSON.parse(raw);
@@ -221,7 +235,11 @@ export class HubClient {
     }
     const parsed = ServerMessageSchema.safeParse(json);
     if (!parsed.success) {
-      console.warn("[hub] invalid frame dropped", parsed.error.issues, json);
+      // Log only the validation issues (paths + codes), never the frame itself.
+      console.warn(
+        "[hub] invalid frame dropped",
+        parsed.error.issues.slice(0, 5).map((i) => `${i.path.join(".")}: ${i.code}`),
+      );
       return;
     }
     const msg = parsed.data;

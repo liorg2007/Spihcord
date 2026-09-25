@@ -26,6 +26,18 @@ npmRebuild: false
 # it; keep this in sync with the installed electron devDependency.
 electronVersion: 44.4.4
 
+# Electron fuses (security C1), flipped in the packaged binary at build time.
+# Verify: python3 security/client/read_fuses.py <packaged exe/binary>
+electronFuses:
+  runAsNode: false                                # ELECTRON_RUN_AS_NODE can't turn the exe into node
+  enableNodeOptionsEnvironmentVariable: false     # NODE_OPTIONS ignored
+  enableNodeCliInspectArguments: false            # --inspect / --inspect-brk ignored
+  enableEmbeddedAsarIntegrityValidation: true     # app.asar hash is checked (Windows/macOS)
+  onlyLoadAppFromAsar: true                       # no loose app/ folder next to the asar
+  enableCookieEncryption: true
+  # The renderer is loaded from file://; keep until it moves to a custom protocol.
+  grantFileProtocolExtraPrivileges: true
+
 publish:
   provider: github
   owner: liorg2007
@@ -34,6 +46,12 @@ publish:
 
 win:
   icon: build/icon.ico
+  # Code signing (future, security C2). Once a certificate exists (CSC_LINK /
+  # Azure Trusted Signing), uncomment and set publisherName to the certificate's
+  # subject CN: electron-updater then refuses installers not signed by it.
+  # Do NOT set it while builds are unsigned, or every update is rejected.
+  # signtoolOptions:
+  #   publisherName: ["Your Name or Company"]
   target:
     # x64 only: Windows-on-ARM runs x64 apps via emulation, and listing two
     # arches makes NSIS bundle both into one ~2x larger installer.

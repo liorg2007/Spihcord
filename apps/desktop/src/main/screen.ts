@@ -155,7 +155,13 @@ export function selectSource(raw: unknown): ScreenSelectResult {
   const req = raw as Partial<ScreenSelectRequest> | null;
   pending = null;
   const portal = req?.sourceId === PORTAL_SOURCE && getPlatformCaps().sourcePicker === "system";
-  if (!req || typeof req.sourceId !== "string" || (!portal && !SOURCE_ID_RE.test(req.sourceId))) {
+  // Only ids the picker was actually shown (latest getSources() result), or the
+  // Wayland portal pseudo-source (security C4).
+  if (
+    !req ||
+    typeof req.sourceId !== "string" ||
+    (!portal && (!SOURCE_ID_RE.test(req.sourceId) || !lastSources.has(req.sourceId)))
+  ) {
     return { ok: false, audio: "none", reason: "invalid source" };
   }
   const wanted: ScreenAudioMode = req.audio === "system" || req.audio === "app" ? req.audio : "none";
@@ -196,7 +202,15 @@ export function setupDisplayMediaHandler(isTrustedFrame: (frame: Electron.WebFra
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
     const sel = pending;
     pending = null; // single use
-    if (!sel || sel.expiresAt < Date.now() || !request.videoRequested || !isTrustedFrame(request.frame)) {
+    // userGesture: getDisplayMedia() must come from a click (Go Live); the
+    // transient activation survives the screen:select IPC round trip.
+    if (
+      !sel ||
+      sel.expiresAt < Date.now() ||
+      !request.videoRequested ||
+      !request.userGesture ||
+      !isTrustedFrame(request.frame)
+    ) {
       // Rejects getDisplayMedia() with an AbortError.
       callback(null as unknown as Parameters<typeof callback>[0]);
       return;
