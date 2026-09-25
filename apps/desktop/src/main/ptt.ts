@@ -4,7 +4,10 @@
  * native module is missing or fails to start, the renderer falls back to
  * window-focused keydown/keyup.
  */
+import { systemPreferences } from "electron";
 import { createRequire } from "node:module";
+import { release } from "node:os";
+import { modifierLabel, platformCaps } from "../shared/platform";
 import type { PttBinding, PttRegisterResult } from "../shared/ipc";
 
 type UiohookModule = typeof import("uiohook-napi");
@@ -43,6 +46,12 @@ function domCodeForUiohookName(name: string): string {
 
 function load(): UiohookModule | null {
   if (mod || loadError) return mod;
+  if (!platformCaps(process.platform, process.env, release()).globalPtt) {
+    // Wayland (or an unknown platform): no global input hook is possible; don't
+    // even load the native module.
+    loadError = "Global hotkeys aren't supported on this desktop session (Wayland).";
+    return null;
+  }
   try {
     mod = nodeRequire("uiohook-napi") as UiohookModule;
     for (const [name, code] of Object.entries(mod.UiohookKey)) {
@@ -62,6 +71,19 @@ export function isGlobalPttAvailable(): boolean {
   return load() !== null;
 }
 
+/**
+ * macOS: uiohook needs the Accessibility permission, otherwise the hook either
+ * fails to start or sees no events. `prompt` shows the system dialog.
+ */
+export function accessibilityStatus(prompt = false): "granted" | "denied" | "not-needed" {
+  if (process.platform !== "darwin") return "not-needed";
+  try {
+    return systemPreferences.isTrustedAccessibilityClient(prompt) ? "granted" : "denied";
+  } catch {
+    return "denied";
+  }
+}
+
 // DOM MouseEvent.button: 1 middle, 3 back, 4 forward. uiohook: 3 middle, 4 X1, 5 X2.
 const MOUSE_DOM_TO_UIO: Record<string, number> = { Mouse3: 3, Mouse4: 4, Mouse5: 5 };
 const MOUSE_UIO_TO_DOM: Record<number, string> = { 3: "Mouse3", 4: "Mouse4", 5: "Mouse5" };
@@ -72,7 +94,7 @@ function labelFor(code: string): string {
   if (code === "Mouse3") return "Middle Mouse";
   if (code === "Mouse4") return "Mouse 4";
   if (code === "Mouse5") return "Mouse 5";
-  return code.replace(/Left$/, "").replace(/Right$/, " (R)");
+  return modifierLabel(code, process.platform) ?? code.replace(/Left$/, "").replace(/Right$/, " (R)");
 }
 
 type Target = { kind: "key"; keycode: number } | { kind: "mouse"; button: number };
@@ -116,6 +138,9 @@ function setPressed(next: boolean): void {
 function ensureHook(): string | undefined {
   const m = load();
   if (!m) return loadError ?? "uiohook-napi not available";
+  if (accessibilityStatus() === "denied") {
+    return "Shpihcord needs the Accessibility permission for global push-to-talk.";
+  }
   if (!hook) {
     hook = m.uIOhook;
     hook.on("keydown", handleKeyDown);

@@ -11,11 +11,17 @@ import {
   shutdownPtt,
 } from "./ptt";
 import { setupPermissions } from "./permissions";
+import { setupAutoUpdater } from "./updater";
+import { applyEarlySwitches, setupAppMenu, setupPlatformIpc, trayImage } from "./platformSetup";
 import { getAudioSupport, getSources, selectSource, setupDisplayMediaHandler } from "./screen";
 
 const BG = "#1e1f22";
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+/** macOS: closing the window only hides it (app keeps running in the dock) until a real quit. */
+let quitting = false;
+
+applyEarlySwitches();
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -105,6 +111,12 @@ function createWindow(): void {
   win.on("restore", sendVisibility);
   win.on("hide", sendVisibility);
   win.on("show", sendVisibility);
+  win.on("close", (event) => {
+    if (process.platform === "darwin" && !quitting) {
+      event.preventDefault();
+      win.hide();
+    }
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -132,7 +144,9 @@ function createWindow(): void {
 
 function createTray(): void {
   try {
-    tray = new Tray(makeIcon(process.platform === "win32" ? 16 : 22));
+    // Linux without an AppIndicator/StatusNotifier host throws or shows nothing;
+    // the app still works (window-all-closed quits there).
+    tray = new Tray(trayImage(makeIcon));
     tray.setToolTip("Shpihcord");
     tray.setContextMenu(
       Menu.buildFromTemplate([
@@ -184,6 +198,8 @@ function setupIpc(): void {
     (frame) => !!frame && !!mainWindow && !mainWindow.isDestroyed() && frame === mainWindow.webContents.mainFrame,
   );
 
+  setupPlatformIpc(trusted);
+
   setPttStateListener((pressed) => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.pttState, pressed);
   });
@@ -191,14 +207,16 @@ function setupIpc(): void {
 
 function onReady(): void {
   if (process.platform === "win32") app.setAppUserModelId("app.shpihcord.desktop");
-  Menu.setApplicationMenu(null);
+  setupAppMenu();
   setupPermissions(session.defaultSession);
   setupIpc();
   createWindow();
   createTray();
+  setupAutoUpdater(() => mainWindow);
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    showWindow(); // dock icon click
+
   });
 }
 
@@ -211,7 +229,10 @@ app.on("web-contents-created", (_e, contents) => {
   });
 });
 
-app.on("before-quit", () => shutdownPtt());
+app.on("before-quit", () => {
+  quitting = true;
+  shutdownPtt();
+});
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

@@ -3,12 +3,15 @@ import { SCREEN_SHARE_PRESETS, type ScreenSharePresetId } from "@shpihcord/call-
 import type { ScreenAudioMode, ScreenAudioSupport, ScreenSource } from "../../../shared/ipc";
 import { bridge } from "../lib/bridge";
 import { formatMbps } from "../lib/format";
+import { useCaps } from "../lib/platform";
 import { getScreenAudioSupport, startScreenShare } from "../lib/voice";
 import { setApp, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { AppWindowIcon, MonitorIcon, WarningIcon, XIcon } from "./Icons";
 
 type Tab = "screen" | "window";
+/** Wayland: the xdg-desktop-portal dialog picks the source at getDisplayMedia time. */
+const PORTAL_SOURCE: ScreenSource = { id: "portal", name: "Screen", kind: "screen", thumbnail: "", appIcon: null, displayId: "" };
 const REFRESH_MS = 3000;
 export const PRESET_ORDER: ScreenSharePresetId[] = ["text", "balanced", "gaming", "source"];
 
@@ -34,12 +37,21 @@ export function GoLiveModal() {
     return ch ? Object.values(s.voiceStates).filter((v) => v.channelId === ch && v.userId !== s.self?.id).length : 0;
   });
   const close = useCallback(() => setApp({ goLiveOpen: false }), []);
+  const caps = useCaps();
+  const portal = caps?.sourcePicker === "system";
+  const [screenPerm, setScreenPerm] = useState<string>("granted");
 
   useEffect(() => {
     void getScreenAudioSupport().then(setSupport);
+    if (!caps || portal) return;
     let alive = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const refresh = async () => {
+      if (caps.needsScreenPermission) {
+        // macOS returns blank thumbnails (only our own windows) without the permission.
+        const perm = await bridge.screen.permission().catch(() => "unknown");
+        if (alive) setScreenPerm(perm);
+      }
       try {
         const list = await bridge.screen.getSources();
         if (alive) setSources(list);
@@ -50,13 +62,18 @@ export function GoLiveModal() {
       if (alive) timer = setTimeout(() => void refresh(), REFRESH_MS);
     };
     void refresh();
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [caps, portal]);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
     };
     window.addEventListener("keydown", onKey);
     return () => {
-      alive = false;
-      if (timer) clearTimeout(timer);
       window.removeEventListener("keydown", onKey);
     };
   }, [close]);
@@ -66,7 +83,8 @@ export function GoLiveModal() {
     setTab(t);
     if (selected && !selected.startsWith(t)) setSelected(null);
   };
-  const selectedSource = sources?.find((s) => s.id === selected) ?? null;
+  const selectedSource = portal ? PORTAL_SOURCE : (sources?.find((s) => s.id === selected) ?? null);
+  const permBlocked = screenPerm === "denied" || screenPerm === "restricted";
 
   // Pick the first screen by default; drop a selection whose window closed.
   useEffect(() => {
@@ -103,45 +121,71 @@ export function GoLiveModal() {
           </button>
         </header>
 
-        <div className="golive-tabs" role="tablist">
-          <button role="tab" aria-selected={tab === "screen"} className={tab === "screen" ? "selected" : ""} onClick={() => switchTab("screen")}>
-            <MonitorIcon size={16} /> Screens
-          </button>
-          <button role="tab" aria-selected={tab === "window"} className={tab === "window" ? "selected" : ""} onClick={() => switchTab("window")}>
-            <AppWindowIcon size={16} /> Applications
-          </button>
-        </div>
-
-        <div className="golive-sources">
-          {sources === null && (
-            <div className="golive-empty">
-              <span className="spinner small" /> Looking for things to share…
+        {portal ? (
+          <div className="golive-portal">
+            <MonitorIcon size={28} />
+            <div>
+              <div className="toggle-title">Your system will ask what to share</div>
+              <div className="settings-hint">
+                On Wayland, pick a screen or window in the system dialog that opens after you click Go Live.
+              </div>
             </div>
-          )}
-          {sources !== null && list.length === 0 && (
-            <div className="golive-empty muted">{tab === "screen" ? "No screens found." : "No application windows found."}</div>
-          )}
-          {list.map((s) => (
-            <button
-              key={s.id}
-              className={`source-card${selected === s.id ? " selected" : ""}`}
-              onClick={() => setSelected(s.id)}
-              onDoubleClick={() => {
-                setSelected(s.id);
-                void goLive(s);
-              }}
-              title={s.name}
-            >
-              <div className="source-thumb">
-                {s.thumbnail ? <img src={s.thumbnail} alt="" draggable={false} /> : <span className="muted">No preview</span>}
+          </div>
+        ) : (
+          <>
+            {permBlocked && (
+              <div className="golive-note warn">
+                <WarningIcon size={16} />
+                <span>
+                  Shpihcord needs Screen Recording permission to show and share your screens. Turn it on in System
+                  Settings → Privacy &amp; Security → Screen &amp; System Audio Recording, then restart Shpihcord.{" "}
+                  <button className="btn btn-secondary btn-small" onClick={() => void bridge.openSystemSettings("screen")}>
+                    Open System Settings
+                  </button>
+                </span>
               </div>
-              <div className="source-name">
-                {s.appIcon && <img className="source-icon" src={s.appIcon} alt="" draggable={false} />}
-                <span>{s.name}</span>
-              </div>
-            </button>
-          ))}
-        </div>
+            )}
+            <div className="golive-tabs" role="tablist">
+              <button role="tab" aria-selected={tab === "screen"} className={tab === "screen" ? "selected" : ""} onClick={() => switchTab("screen")}>
+                <MonitorIcon size={16} /> Screens
+              </button>
+              <button role="tab" aria-selected={tab === "window"} className={tab === "window" ? "selected" : ""} onClick={() => switchTab("window")}>
+                <AppWindowIcon size={16} /> Applications
+              </button>
+            </div>
+
+            <div className="golive-sources">
+              {sources === null && (
+                <div className="golive-empty">
+                  <span className="spinner small" /> Looking for things to share…
+                </div>
+              )}
+              {sources !== null && list.length === 0 && (
+                <div className="golive-empty muted">{tab === "screen" ? "No screens found." : "No application windows found."}</div>
+              )}
+              {list.map((s) => (
+                <button
+                  key={s.id}
+                  className={`source-card${selected === s.id ? " selected" : ""}`}
+                  onClick={() => setSelected(s.id)}
+                  onDoubleClick={() => {
+                    setSelected(s.id);
+                    void goLive(s);
+                  }}
+                  title={s.name}
+                >
+                  <div className="source-thumb">
+                    {s.thumbnail ? <img src={s.thumbnail} alt="" draggable={false} /> : <span className="muted">No preview</span>}
+                  </div>
+                  <div className="source-name">
+                    {s.appIcon && <img className="source-icon" src={s.appIcon} alt="" draggable={false} />}
+                    <span>{s.name}</span>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
 
         <div className="golive-options">
           <div className="field-label">Stream Quality</div>

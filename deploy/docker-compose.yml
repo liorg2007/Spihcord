@@ -2,6 +2,10 @@ name: shpihcord
 
 services:
   hub:
+    # Prebuilt image from GitHub Releases CI. Pin a version with HUB_TAG=0.2.0 in .env.
+    # If the image can't be pulled, compose falls back to building it from this
+    # repo (needs the full checkout: `docker compose up -d --build`).
+    image: ghcr.io/liorg2007/shpihcord-hub:${HUB_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile

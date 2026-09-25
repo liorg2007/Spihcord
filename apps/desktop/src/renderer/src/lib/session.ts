@@ -85,7 +85,7 @@ export async function bootstrap(): Promise<void> {
 
 export async function loginWith(session: StoredSession): Promise<void> {
   rememberLogin(session);
-  let persisted = false;
+  let persisted: boolean | "plaintext" = false;
   try {
     persisted = await bridge.session.save(session);
   } catch (err) {
@@ -94,6 +94,8 @@ export async function loginWith(session: StoredSession): Promise<void> {
   startSession(session);
   if (!persisted && bridge.platform !== "browser") {
     toast("Secure storage isn't available, so you'll need to log in again next time.", "info", 8000);
+  } else if (persisted === "plaintext") {
+    toast("No system keyring found, so your login is saved unencrypted on this computer. Install gnome-keyring or KWallet to protect it.", "info", 10000);
   }
 }
 

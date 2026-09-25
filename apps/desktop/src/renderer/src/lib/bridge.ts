@@ -1,3 +1,4 @@
+import { platformCaps } from "../../../shared/platform";
 import type { PttRegisterResult, ShpihcordApi, StoredSession } from "../../../shared/ipc";
 
 /**
@@ -10,6 +11,8 @@ function browserFallback(): ShpihcordApi {
   return {
     platform: "browser",
     getVersion: async () => "dev",
+    caps: async () => platformCaps("browser", {}, ""),
+    openSystemSettings: async () => {},
     session: {
       load: async () => mem,
       save: async (s) => {
@@ -26,10 +29,12 @@ function browserFallback(): ShpihcordApi {
       onState: () => () => {},
       record: async () => null,
       cancelRecord: () => {},
+      accessibility: async () => "not-needed",
     },
     screen: {
       getSources: async () => [],
       audioSupport: async () => ({ system: false, excludesOwnAudio: false, appAudio: false, note: "Not running in Electron." }),
+      permission: async () => "granted",
       select: async () => ({ ok: false, audio: "none", reason: "not running in Electron" }),
     },
     window: {

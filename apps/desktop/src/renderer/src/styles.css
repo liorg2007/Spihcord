@@ -2225,6 +2225,25 @@ h3 {
   flex-shrink: 0;
   margin-top: 1px;
 }
+.golive > .golive-note {
+  margin: 0 20px 8px;
+}
+.golive-note .btn {
+  margin-top: 6px;
+}
+.golive-portal {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 4px 20px 12px;
+  padding: 20px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+}
+.settings-inline-action {
+  margin-left: 8px;
+}
 
 /* ------------------------------------------------------------------ */
 /* Camera                                                              */

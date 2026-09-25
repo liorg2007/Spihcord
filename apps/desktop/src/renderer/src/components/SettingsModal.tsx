@@ -3,13 +3,14 @@ import type { PttBinding } from "../../../shared/ipc";
 import { bridge } from "../lib/bridge";
 import { hostOf } from "../lib/format";
 import { startMicTest } from "../lib/micTest";
-import { bindingFromKeyboardEvent, bindingFromMouseEvent, setPttRecording } from "../lib/ptt";
+import { bindingFromKeyboardEvent, bindingFromMouseEvent, refreshPtt, setPttRecording } from "../lib/ptt";
+import { useCaps } from "../lib/platform";
 import { logout } from "../lib/session";
 import { setApp, useApp } from "../store/app";
 import { StreamVideo } from "./Stream";
 import { useSettings, type Settings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { KeyboardIcon, LogOutIcon, MicIcon, ShieldIcon, VideoOffIcon, XIcon } from "./Icons";
+import { KeyboardIcon, LogOutIcon, MicIcon, ShieldIcon, VideoOffIcon, WarningIcon, XIcon } from "./Icons";
 
 type Tab = "voice" | "account";
 
@@ -384,10 +385,37 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
   const [recording, setRecording] = useState(false);
   const pttGlobal = useApp((s) => s.pttGlobal);
   const [globalAvailable, setGlobalAvailable] = useState<boolean | null>(null);
+  const caps = useCaps();
+  const [axStatus, setAxStatus] = useState<string>("not-needed");
 
   useEffect(() => {
     void bridge.ptt.isGlobalAvailable().then(setGlobalAvailable).catch(() => setGlobalAvailable(false));
   }, []);
+
+  // macOS: poll Accessibility while settings are open; re-register once it's granted.
+  useEffect(() => {
+    if (!caps?.needsAccessibility) return;
+    let alive = true;
+    let last = "";
+    const check = () =>
+      void bridge.ptt.accessibility(false).then((st) => {
+        if (!alive) return;
+        setAxStatus(st);
+        if (last && last !== st && st === "granted") refreshPtt();
+        last = st;
+      });
+    check();
+    const t = setInterval(check, 2000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [caps]);
+
+  const askAccessibility = () => {
+    void bridge.ptt.accessibility(true);
+    void bridge.openSystemSettings("accessibility");
+  };
 
   useEffect(() => {
     if (!recording) return;
@@ -416,7 +444,9 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
     // Also listen system-wide, so keys the window can't see (e.g. while unfocused) work too.
     void bridge.ptt.record(15000).then((b) => {
       if (b) finish(b);
-      else if (!done && globalAvailable) finish(null); // global recorder timed out
+      // Global recorder timed out (it resolves null at once if the hook can't start,
+      // e.g. macOS without Accessibility; then keep recording in-window).
+      else if (!done && globalAvailable && axStatus !== "denied") finish(null);
     });
     const timeout = setTimeout(() => finish(null), 15000);
     return () => {
@@ -440,8 +470,22 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
           {recording ? "Cancel" : "Record Keybind"}
         </button>
       </div>
+      {axStatus === "denied" && (
+        <div className="golive-note warn">
+          <WarningIcon size={16} />
+          <span>
+            Global push-to-talk needs Accessibility access. Allow Shpihcord in System Settings → Privacy &amp; Security →
+            Accessibility. Until then, push-to-talk only works while Shpihcord is focused.{" "}
+            <button className="btn btn-secondary btn-small" onClick={askAccessibility}>
+              Grant Access
+            </button>
+          </span>
+        </div>
+      )}
       <p className="settings-hint">
-        {globalAvailable === false
+        {caps?.wayland
+          ? "Wayland doesn't let apps watch keys globally, so push-to-talk only works while Shpihcord is focused."
+          : globalAvailable === false
           ? "Global hotkeys aren't available on this system, so push-to-talk only works while Shpihcord is focused."
           : pttGlobal
             ? "Works everywhere, even while you're in a game."

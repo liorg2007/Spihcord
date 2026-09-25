@@ -4,6 +4,19 @@ Runs three containers: **hub** (accounts, presence, voice signaling), **caddy**
 (automatic HTTPS, proxies `/api` and `/ws` to the hub) and **coturn** (TURN relay
 for peers that can't connect directly).
 
+## Quick install (one command)
+
+On a fresh Linux VPS whose domain already points at it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/liorg2007/Spihcord/main/deploy/install.sh | sudo bash
+```
+
+It installs Docker if needed, asks for the domain, writes `.env` with a random
+`TURN_SECRET`, starts everything from the prebuilt image
+`ghcr.io/liorg2007/shpihcord-hub` and prints the invite code. Files live in
+`/opt/shpihcord`. The manual steps below do the same thing.
+
 ## Host setup
 
 1. A Linux box with Docker + the compose plugin, and a DNS record (`A`/`AAAA`)
@@ -24,7 +37,7 @@ for peers that can't connect directly).
    git clone <repo> shpihcord && cd shpihcord/deploy
    cp .env.example .env
    # edit .env: DOMAIN=chat.example.com, TURN_SECRET=$(openssl rand -hex 32)
-   docker compose up -d --build
+   docker compose up -d          # pulls ghcr.io/liorg2007/shpihcord-hub (or: --build from source)
    docker compose logs hub      # shows the first-run invite code
    ```
 

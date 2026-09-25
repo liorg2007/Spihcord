@@ -4,6 +4,7 @@
  * global hook isn't available.
  */
 import type { PttBinding } from "../../../shared/ipc";
+import { modifierLabel } from "../../../shared/platform";
 import { getApp, setApp } from "../store/app";
 import { getSettings, useSettings } from "../store/settings";
 import { bridge } from "./bridge";
@@ -89,6 +90,11 @@ export function initPtt(): void {
   void refresh();
 }
 
+/** Re-register the binding (e.g. after macOS Accessibility was granted). */
+export function refreshPtt(): void {
+  void refresh();
+}
+
 /** Pause PTT while the settings modal records a new keybind. */
 export function setPttRecording(on: boolean): void {
   if (recording === on) return;
@@ -104,7 +110,7 @@ export function bindingFromKeyboardEvent(e: KeyboardEvent): PttBinding {
   else if (code.startsWith("Digit")) label = code.slice(5);
   else if (e.key.length === 1 && e.key !== " ") label = e.key.toUpperCase();
   else if (code === "Space") label = "Space";
-  else label = code.replace(/Left$/, "").replace(/Right$/, " (R)").replace(/^Control/, "Ctrl");
+  else label = modifierLabel(code, bridge.platform) ?? code.replace(/Left$/, "").replace(/Right$/, " (R)");
   return { code, label };
 }
 

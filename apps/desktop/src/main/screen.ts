@@ -16,12 +16,15 @@
  *  - Windows 11: "app" mode captures only the shared window's process tree via
  *    Chromium's "applicationLoopback:<pid>" device (the pid comes from the HWND
  *    in the source id, resolved with GetWindowThreadProcessId through koffi).
+ *  - Linux/Wayland: desktopCapturer can't enumerate; the xdg-desktop-portal
+ *    picker chooses (see PORTAL_SOURCE). Needs the WebRTCPipeWireCapturer feature.
  *  - Linux: plain "loopback" (PulseAudio/PipeWire monitor). No exclusion is
  *    possible, so the UI warns that friends will hear themselves.
  */
-import { BrowserWindow, desktopCapturer, session, type DesktopCapturerSource } from "electron";
+import { BrowserWindow, desktopCapturer, session, systemPreferences, type DesktopCapturerSource } from "electron";
 import { createRequire } from "node:module";
 import { release } from "node:os";
+import { platformCaps, windowsBuild, type PlatformCaps } from "../shared/platform";
 import type { ScreenAudioMode, ScreenAudioSupport, ScreenSelectRequest, ScreenSelectResult, ScreenSource } from "../shared/ipc";
 
 const nodeRequire = createRequire(import.meta.url);
@@ -44,11 +47,6 @@ let inflight: Promise<ScreenSource[]> | null = null;
 // ---------------------------------------------------------------------------
 // Platform support
 // ---------------------------------------------------------------------------
-
-function windowsBuild(): number {
-  const parts = release().split(".");
-  return Number(parts[2] ?? 0) || 0;
-}
 
 type GetPidFn = (hwnd: number) => number | null;
 let getPidFn: GetPidFn | null | undefined;
@@ -73,50 +71,30 @@ function pidResolver(): GetPidFn | null {
   return getPidFn;
 }
 
-let supportCache: ScreenAudioSupport | null = null;
+let capsCache: PlatformCaps | null = null;
+
+/** Capabilities of this machine (computed once). */
+export function getPlatformCaps(): PlatformCaps {
+  capsCache ??= platformCaps(process.platform, process.env, release(), {
+    // Only probe koffi where it matters (Windows 11); never load it elsewhere.
+    pidResolver: process.platform === "win32" && windowsBuild(release()) >= 22000 ? !!pidResolver() : false,
+  });
+  return capsCache;
+}
 
 export function getAudioSupport(): ScreenAudioSupport {
-  if (supportCache) return supportCache;
-  let s: ScreenAudioSupport;
-  switch (process.platform) {
-    case "win32": {
-      const build = windowsBuild();
-      const excludes = build >= 19045;
-      s = {
-        system: true,
-        excludesOwnAudio: excludes,
-        // Chromium only enables per-application loopback on Windows 11.
-        appAudio: build >= 22000 && !!pidResolver(),
-        note: excludes
-          ? undefined
-          : "This Windows version can't keep Shpihcord's own audio out of the stream, so friends may hear themselves. Update Windows (10 22H2 or 11), or turn off stream audio.",
-      };
-      break;
-    }
-    case "darwin": {
-      // Darwin 22 = macOS 13, where ScreenCaptureKit system audio starts.
-      const darwinMajor = Number(release().split(".")[0]) || 0;
-      const ok = darwinMajor >= 22;
-      s = {
-        system: ok,
-        excludesOwnAudio: ok,
-        appAudio: false,
-        note: ok
-          ? "macOS will ask for Screen & System Audio Recording permission the first time."
-          : "Sharing system audio needs macOS 13 or later.",
-      };
-      break;
-    }
-    default:
-      s = {
-        system: true,
-        excludesOwnAudio: false,
-        appAudio: false,
-        note: "On Linux, stream audio includes everything you hear, including voice chat, so friends will hear themselves (headphones don't help). Turn off stream audio if that's a problem.",
-      };
+  const c = getPlatformCaps();
+  return { system: c.systemAudio, excludesOwnAudio: c.excludeOwnAudio, appAudio: c.appAudio, note: c.audioNote };
+}
+
+/** macOS Screen Recording (TCC) status; "granted" elsewhere. */
+export function screenPermission(): string {
+  if (process.platform !== "darwin") return "granted";
+  try {
+    return systemPreferences.getMediaAccessStatus("screen");
+  } catch {
+    return "unknown";
   }
-  supportCache = s;
-  return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +124,9 @@ function toSource(src: DesktopCapturerSource): ScreenSource {
 }
 
 export function getSources(): Promise<ScreenSource[]> {
+  // Wayland: every getSources() call pops the xdg-desktop-portal dialog, so the
+  // renderer skips the grid and the portal picks at getDisplayMedia time.
+  if (getPlatformCaps().sourcePicker === "system") return Promise.resolve([]);
   // Refreshes are polled; share one capture pass between overlapping calls.
   if (inflight) return inflight;
   inflight = desktopCapturer
@@ -166,12 +147,15 @@ export function getSources(): Promise<ScreenSource[]> {
 // Selection + getDisplayMedia handler
 // ---------------------------------------------------------------------------
 
+/** Pseudo source id: "let the OS portal choose" (Wayland). */
+const PORTAL_SOURCE = "portal";
 const SOURCE_ID_RE = /^(screen|window):[-\d]+:[-\d]+$/;
 
 export function selectSource(raw: unknown): ScreenSelectResult {
   const req = raw as Partial<ScreenSelectRequest> | null;
   pending = null;
-  if (!req || typeof req.sourceId !== "string" || !SOURCE_ID_RE.test(req.sourceId)) {
+  const portal = req?.sourceId === PORTAL_SOURCE && getPlatformCaps().sourcePicker === "system";
+  if (!req || typeof req.sourceId !== "string" || (!portal && !SOURCE_ID_RE.test(req.sourceId))) {
     return { ok: false, audio: "none", reason: "invalid source" };
   }
   const wanted: ScreenAudioMode = req.audio === "system" || req.audio === "app" ? req.audio : "none";
@@ -217,8 +201,35 @@ export function setupDisplayMediaHandler(isTrustedFrame: (frame: Electron.WebFra
       callback(null as unknown as Parameters<typeof callback>[0]);
       return;
     }
-    const streams: Parameters<typeof callback>[0] = { video: { id: sel.sourceId, name: sel.name } };
-    if (request.audioRequested && sel.audioDevice) {
+    if (sel.sourceId === PORTAL_SOURCE) {
+      // Wayland/PipeWire: this getSources() call shows the portal dialog and
+      // resolves with the single source the user picked (empty if cancelled).
+      desktopCapturer
+        .getSources({ types: ["screen", "window"], thumbnailSize: { width: 0, height: 0 } })
+        .then((list) => {
+          const src = list[0];
+          if (!src) {
+            callback(null as unknown as Parameters<typeof callback>[0]);
+            return;
+          }
+          grant(callback, request.audioRequested, { ...sel, sourceId: src.id, name: src.name || "Screen" });
+        })
+        .catch((err: unknown) => {
+          console.warn("[screen] portal capture failed:", err);
+          callback(null as unknown as Parameters<typeof callback>[0]);
+        });
+      return;
+    }
+    grant(callback, request.audioRequested, sel);
+  });
+}
+
+type GrantCallback = (streams: Electron.Streams) => void;
+
+function grant(callback: GrantCallback, audioRequested: boolean, sel: PendingSelection): void {
+  {
+    const streams: Parameters<GrantCallback>[0] = { video: { id: sel.sourceId, name: sel.name } };
+    if (audioRequested && sel.audioDevice) {
       // "loopback" is upgraded to "loopbackWithoutChrome" by Electron when the
       // renderer requested restrictOwnAudio (Windows/macOS). The typings only
       // list "loopback" | "loopbackWithMute", but any Chromium loopback device
@@ -226,5 +237,5 @@ export function setupDisplayMediaHandler(isTrustedFrame: (frame: Electron.WebFra
       streams.audio = sel.audioDevice as "loopback";
     }
     callback(streams);
-  });
+  }
 }

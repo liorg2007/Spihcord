@@ -8,32 +8,87 @@ files:
   - out/**/*
   - package.json
   - "!**/*.map"
+extraResources:
+  # Tray icons, read at runtime from process.resourcesPath.
+  - from: resources
+    to: .
+    filter: ["tray*.png"]
 asarUnpack:
+  # Native addons must live outside the asar to be dlopen()ed.
+  # uiohook-napi bundles prebuilds/<os>-<arch>; koffi 3 ships its binary in a
+  # per-platform optional dependency (@koromix/koffi-<os>-<arch>).
   - "**/node_modules/uiohook-napi/**"
   - "**/node_modules/koffi/**"
-# uiohook-napi and koffi ship N-API prebuilds (ABI-stable), no rebuild against Electron needed.
+  - "**/node_modules/@koromix/**"
+# Both addons are N-API (ABI-stable) prebuilds: no rebuild against Electron needed.
 npmRebuild: false
+# electron is hoisted to the workspace root, so electron-builder cannot detect
+# it; keep this in sync with the installed electron devDependency.
+electronVersion: 44.4.4
+
+publish:
+  provider: github
+  owner: liorg2007
+  repo: Spihcord
+  releaseType: draft
+
 win:
+  icon: build/icon.ico
   target:
+    # x64 only: Windows-on-ARM runs x64 apps via emulation, and listing two
+    # arches makes NSIS bundle both into one ~2x larger installer.
     - target: nsis
       arch: [x64]
   artifactName: ${productName}-Setup-${version}.${ext}
 nsis:
+  # Assisted (not one-click) per-user installer: no UAC prompt, but friends
+  # still see where it goes and can pick a folder. Updates install silently.
   oneClick: false
   perMachine: false
+  allowElevation: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
+  createStartMenuShortcut: true
+  runAfterFinish: true
   shortcutName: Shpihcord
-linux:
-  target:
-    - target: AppImage
-      arch: [x64]
-  category: Network
-  artifactName: ${productName}-${version}.${ext}
+  deleteAppDataOnUninstall: false
+
 mac:
-  target: dmg
+  icon: build/icon.icns
+  target:
+    - target: dmg
+      arch: [x64, arm64]
+    # zip is what electron-updater downloads on macOS.
+    - target: zip
+      arch: [x64, arm64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
   category: public.app-category.social-networking
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # `notarize` is left unset on purpose: electron-builder notarizes only when
+  # APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID are in the env and
+  # the app was signed (CSC_LINK). Otherwise it logs "skipped" and the build
+  # is still produced (unsigned / ad-hoc signed).
   extendInfo:
     NSMicrophoneUsageDescription: Shpihcord needs the microphone for voice chat.
     NSCameraUsageDescription: Shpihcord uses the camera when you turn on video in a voice channel.
     NSAudioCaptureUsageDescription: Shpihcord captures system audio when you share your screen.
+    NSScreenCaptureUsageDescription: Shpihcord captures your screen when you go live.
+dmg:
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+linux:
+  icon: build/icon.png
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+  category: Network
+  maintainer: Shpihcord <noreply@users.noreply.github.com>
+  synopsis: Self-hosted voice, video and text chat for friends
+  artifactName: ${productName}-${version}-${arch}.${ext}
+deb:
+  depends: ["libnotify4", "libxtst6", "libnss3", "libasound2 | libasound2t64"]

@@ -180,7 +180,9 @@ function describeMediaError(err: unknown): string {
   switch (name) {
     case "NotAllowedError":
     case "SecurityError":
-      return "Microphone access was denied. Allow microphone access for Shpihcord and try again.";
+      return bridge.platform === "darwin"
+        ? "Microphone access was denied. Allow Shpihcord in System Settings → Privacy & Security → Microphone, then try again."
+        : "Microphone access was denied. Allow microphone access for Shpihcord and try again.";
     case "NotFoundError":
       return "No microphone was found. Plug one in or pick another input device in Settings.";
     case "OverconstrainedError":
@@ -550,7 +552,7 @@ function describeCaptureError(err: unknown): string {
   switch (name) {
     case "NotAllowedError":
       return bridge.platform === "darwin"
-        ? "Screen recording isn't allowed. Enable Shpihcord in System Settings → Privacy & Security → Screen & System Audio Recording."
+        ? "Screen recording isn't allowed. Enable Shpihcord in System Settings → Privacy & Security → Screen & System Audio Recording, then restart Shpihcord."
         : "Screen capture was blocked.";
     case "AbortError":
     case "NotReadableError":

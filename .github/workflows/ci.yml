@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: E2E (Windows)
+        if: runner.os == 'Windows'
+        run: npm run test:e2e
+
+      - name: E2E (Linux, xvfb)
+        if: runner.os == 'Linux'
+        # Hidden Electron windows + fake media devices; not yet proven on Linux CI.
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgbm1 libasound2t64 libnss3 libxss1 libxtst6
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" npm run test:e2e

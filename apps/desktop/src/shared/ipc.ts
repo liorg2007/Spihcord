@@ -3,12 +3,17 @@
  * the renderer. Keep this file free of runtime imports so every side can use it.
  */
 
+import type { MacSettingsPane, PlatformCaps } from "./platform";
+
 /** Mirror of the protocol `User` (kept local so main doesn't depend on zod). */
 export interface SessionUser {
   id: string;
   username: string;
   displayName: string;
 }
+
+/** true: encrypted with the OS keychain; "plaintext": stored unencrypted (Linux, no keyring); false: not stored. */
+export type SessionSaveResult = boolean | "plaintext";
 
 export interface StoredSession {
   serverUrl: string;
@@ -83,10 +88,14 @@ export interface ScreenSelectResult {
 export interface ShpihcordApi {
   platform: string;
   getVersion(): Promise<string>;
+  /** What this OS / session supports (drives the Go Live and PTT UI). */
+  caps(): Promise<PlatformCaps>;
+  /** macOS: open a Privacy & Security pane in System Settings (no-op elsewhere). */
+  openSystemSettings(pane: MacSettingsPane): Promise<void>;
   session: {
     load(): Promise<StoredSession | null>;
     /** Returns false if OS-level encryption is unavailable (session not persisted). */
-    save(session: StoredSession): Promise<boolean>;
+    save(session: StoredSession): Promise<SessionSaveResult>;
     clear(): Promise<void>;
   };
   ptt: {
@@ -102,10 +111,14 @@ export interface ShpihcordApi {
      */
     record(timeoutMs?: number): Promise<PttBinding | null>;
     cancelRecord(): void;
+    /** macOS Accessibility status for the global hook; `prompt` shows the system dialog. */
+    accessibility(prompt?: boolean): Promise<"granted" | "denied" | "not-needed">;
   };
   screen: {
     getSources(): Promise<ScreenSource[]>;
     audioSupport(): Promise<ScreenAudioSupport>;
+    /** macOS Screen Recording permission ("granted" | "denied" | "not-determined" | ...); "granted" elsewhere. */
+    permission(): Promise<string>;
     /**
      * Arm the next getDisplayMedia() call with this source. Must be followed by
      * getDisplayMedia within a few seconds; the selection is single-use.
@@ -120,10 +133,34 @@ export interface ShpihcordApi {
      */
     onVisibility(handler: (visible: boolean) => void): () => void;
   };
+  /** Optional so non-Electron fallbacks (renderer bridge.ts) need not implement it. */
+  updates?: {
+    /** Latest known auto-update state (null until something happened). */
+    getStatus(): Promise<UpdateStatus | null>;
+    /** Subscribe to auto-update state changes. Returns an unsubscribe fn. */
+    onStatus(handler: (status: UpdateStatus) => void): () => void;
+    /** Quit and install a downloaded update (only when state is "ready"). */
+    install(): void;
+  };
 }
+
+/**
+ * Auto-update state pushed by the main process.
+ * - "ready": downloaded; show "Update ready - restart" and call updates.install().
+ * - "available-manual": a newer release exists but can't be auto-installed
+ *   (unsigned macOS build); show a link to `url` instead.
+ */
+export type UpdateStatus =
+  | { state: "downloading"; version: string; percent: number }
+  | { state: "ready"; version: string }
+  | { state: "available-manual"; version: string; url: string };
 
 export const IPC = {
   version: "app:version",
+  caps: "app:caps",
+  openSystemSettings: "app:open-system-settings",
+  pttAccessibility: "ptt:accessibility",
+  screenPermission: "screen:permission",
   sessionLoad: "session:load",
   sessionSave: "session:save",
   sessionClear: "session:clear",
@@ -136,4 +173,7 @@ export const IPC = {
   screenAudioSupport: "screen:audioSupport",
   screenSelect: "screen:select",
   windowVisibility: "window:visibility",
+  updateStatus: "update:status",
+  updateGetStatus: "update:get-status",
+  updateInstall: "update:install",
 } as const;
