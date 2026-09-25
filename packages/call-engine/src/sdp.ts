@@ -162,6 +162,9 @@ export interface CallSdpOptions {
   screenOpus?: FmtpParams | null;
   /** fmtp params added to every video codec (null = none). */
   videoHints?: FmtpParams | null;
+  /** mids of camera video m-lines (they get `cameraVideoHints` instead of `videoHints`). */
+  cameraMids?: ReadonlySet<string> | null;
+  cameraVideoHints?: FmtpParams | null;
 }
 
 /**
@@ -180,9 +183,11 @@ export function mungeCallSdp(sdp: string, opts: CallSdpOptions): string {
         const params = isMic ? opts.voiceOpus : opts.screenOpus;
         return params ? mungeCodecFmtp(s.text, params, "opus") : s.text;
       }
-      if (s.kind === "video" && opts.videoHints) {
+      const isCamera = s.kind === "video" && !!s.mid && !!opts.cameraMids?.has(s.mid);
+      const hints = isCamera ? opts.cameraVideoHints : opts.videoHints;
+      if (s.kind === "video" && hints) {
         let text = s.text;
-        for (const codec of HINTED_VIDEO_CODECS) text = mungeCodecFmtp(text, opts.videoHints, codec);
+        for (const codec of HINTED_VIDEO_CODECS) text = mungeCodecFmtp(text, hints, codec);
         return text;
       }
       return s.text;
@@ -191,9 +196,14 @@ export function mungeCallSdp(sdp: string, opts: CallSdpOptions): string {
 }
 
 /** Outgoing SDP for a call with screen share: voice Opus on the mic, stereo on screen audio, video bitrate hints. */
-export function mungeOutgoingSdp(sdp: string, micMid?: string | null): string {
+/** Camera m-lines: only a higher start bitrate (no min/max floor, so "low" can go to 150 kbps). */
+export const CAMERA_BITRATE_HINTS: FmtpParams = { "x-google-start-bitrate": 1000 };
+
+export function mungeOutgoingSdp(sdp: string, micMid?: string | null, cameraMids?: ReadonlySet<string> | null): string {
   return mungeCallSdp(sdp, {
     micMid,
+    cameraMids,
+    cameraVideoHints: CAMERA_BITRATE_HINTS,
     voiceOpus: VOICE_OPUS_PARAMS,
     screenOpus: SCREEN_AUDIO_OPUS_PARAMS,
     videoHints: VIDEO_BITRATE_HINTS,

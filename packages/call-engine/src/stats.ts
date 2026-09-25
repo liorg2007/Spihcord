@@ -131,10 +131,13 @@ function codecOf(byId: Map<string, Dict>, s: Dict): string | undefined {
   return (i === -1 ? mime : mime.slice(i + 1)).toUpperCase();
 }
 
-function pickLargest(byId: Map<string, Dict>, type: string, bytesKey: string): Dict | undefined {
+function pickLargest(byId: Map<string, Dict>, type: string, bytesKey: string, mid?: string | null): Dict | undefined {
   let best: Dict | undefined;
-  for (const s of byId.values()) {
-    if (s.type !== type || (s.kind ?? s.mediaType) !== "video") continue;
+  const all = [...byId.values()].filter((s) => s.type === type && (s.kind ?? s.mediaType) === "video");
+  // Filter by mid when requested (legacy stats without `mid` fall back to the largest).
+  const byMid = mid != null && all.some((s) => typeof s.mid === "string");
+  for (const s of all) {
+    if (byMid && s.mid !== mid) continue;
     if (!best || (s[bytesKey] ?? 0) > (best[bytesKey] ?? 0)) best = s;
   }
   return best;
@@ -147,12 +150,19 @@ const num = (v: unknown): number | undefined => (typeof v === "number" && Number
  * one screen video in each direction per connection). Pass the returned
  * `counters` back as `prev` for bitrate deltas.
  */
-export function parseVideoStats(report: StatsReportLike, prev?: VideoCounters): ParsedVideoStats {
+export interface VideoStatsFilter {
+  /** mid of the outbound video to report; null/undefined = don't report send. */
+  sendMid?: string | null;
+  /** mid of the inbound video to report; null/undefined = don't report recv. */
+  recvMid?: string | null;
+}
+
+export function parseVideoStats(report: StatsReportLike, prev?: VideoCounters, filter?: VideoStatsFilter): ParsedVideoStats {
   const byId = new Map<string, Dict>();
   report.forEach((value, key) => byId.set(value?.id ?? key, value));
   const result: ParsedVideoStats = { counters: {} };
 
-  const out = pickLargest(byId, "outbound-rtp", "bytesSent");
+  const out = filter && filter.sendMid == null ? undefined : pickLargest(byId, "outbound-rtp", "bytesSent", filter?.sendMid);
   if (out) {
     const bytes = num(out.bytesSent) ?? 0;
     const ts = num(out.timestamp);
@@ -170,7 +180,7 @@ export function parseVideoStats(report: StatsReportLike, prev?: VideoCounters): 
     result.counters.outTs = ts;
   }
 
-  const inb = pickLargest(byId, "inbound-rtp", "bytesReceived");
+  const inb = filter && filter.recvMid == null ? undefined : pickLargest(byId, "inbound-rtp", "bytesReceived", filter?.recvMid);
   if (inb) {
     const bytes = num(inb.bytesReceived) ?? 0;
     const ts = num(inb.timestamp);

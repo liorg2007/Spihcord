@@ -17,6 +17,9 @@ export interface CodecLike {
  */
 export const SCREEN_CODEC_ORDER: readonly string[] = ["H264", "AV1", "VP9", "VP8"];
 
+/** Camera order: H264, VP9, VP8; AV1 only when hardware-accelerated (then after VP8). */
+export const CAMERA_CODEC_ORDER: readonly string[] = ["H264", "VP9", "VP8", "AV1"];
+
 /** Codecs that are only preferred when hardware accelerated; otherwise they go last. */
 export const HARDWARE_ONLY_CODECS: readonly string[] = ["AV1"];
 
@@ -104,4 +107,14 @@ export function mediaCapabilitiesContentType(c: CodecLike): string {
   const name = codecName(c.mimeType);
   const plid = name === "H264" ? fmtpValue(c.sdpFmtpLine, "profile-level-id") : undefined;
   return plid ? `${c.mimeType};profile-level-id=${plid}` : c.mimeType;
+}
+
+/** Camera codec order (no hardware reordering except AV1 inclusion). */
+export function orderCameraCodecs<T extends CodecLike>(codecs: readonly T[], hardware: ReadonlySet<string>, sendable?: ReadonlySet<string>): T[] {
+  return orderVideoCodecs(codecs, {
+    order: CAMERA_CODEC_ORDER,
+    hardware: new Set(),
+    hardwareOnly: hardware.has("AV1") ? [] : ["AV1"],
+    sendable,
+  });
 }

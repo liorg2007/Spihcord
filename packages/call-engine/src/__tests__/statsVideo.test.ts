@@ -58,3 +58,21 @@ describe("parseVideoStats", () => {
     expect(parseVideoStats(r).send?.width).toBe(1920);
   });
 });
+
+describe("parseVideoStats with a mid filter (camera vs screen)", () => {
+  it("picks the stream of the requested mid in each direction", () => {
+    const r = report(
+      ...codecs,
+      { id: "O1", type: "outbound-rtp", kind: "video", mid: "2", bytesSent: 9_000_000, frameHeight: 1080, timestamp: 1 },
+      { id: "O2", type: "outbound-rtp", kind: "video", mid: "3", bytesSent: 100, frameHeight: 720, timestamp: 1 },
+      { id: "I1", type: "inbound-rtp", kind: "video", mid: "4", bytesReceived: 5, frameHeight: 360, timestamp: 1 },
+    );
+    const cam = parseVideoStats(r, undefined, { sendMid: "3", recvMid: "4" });
+    expect(cam.send?.height).toBe(720);
+    expect(cam.recv?.height).toBe(360);
+    const scr = parseVideoStats(r, undefined, { sendMid: "2", recvMid: null });
+    expect(scr.send?.height).toBe(1080);
+    expect(scr.recv).toBeUndefined();
+    expect(parseVideoStats(r, undefined, { sendMid: "9" }).send).toBeUndefined();
+  });
+});

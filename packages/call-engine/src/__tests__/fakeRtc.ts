@@ -64,10 +64,15 @@ export class FakePC {
     return {};
   }
 
-  addTransceiver(): unknown {
-    this.localTracks.push(`anon-${this.localTracks.length}`);
+  readonly transceivers: FakeTransceiver[] = [];
+
+  addTransceiver(trackOrKind?: unknown, init?: { direction?: string; sendEncodings?: Record<string, unknown>[] }): unknown {
+    const id = typeof trackOrKind === "object" && trackOrKind && "id" in trackOrKind ? String((trackOrKind as { id: string }).id) : `anon-${this.localTracks.length}`;
+    this.localTracks.push(id);
+    const t = new FakeTransceiver(typeof trackOrKind === "object" ? (trackOrKind as { id: string }) : null, init?.direction ?? "sendrecv", init?.sendEncodings ?? [{}]);
+    this.transceivers.push(t);
     this.updateNegotiationNeeded();
-    return {};
+    return t;
   }
 
   restartIce(): void {
@@ -318,5 +323,40 @@ export async function waitFor(cond: () => boolean, timeoutMs = 3000, label = "co
   while (!cond()) {
     if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
     await delay(2);
+  }
+}
+
+/** Minimal RTCRtpTransceiver/RTCRtpSender: replaceTrack and setParameters never touch negotiation. */
+export class FakeTransceiver {
+  mid: string | null = null;
+  currentDirection: string | null = null;
+  readonly sender: {
+    track: unknown;
+    replaceCalls: Array<unknown>;
+    params: { encodings: Record<string, unknown>[]; degradationPreference?: string };
+    setCalls: number;
+    replaceTrack(t: unknown): Promise<void>;
+    getParameters(): unknown;
+    setParameters(p: unknown): Promise<void>;
+  };
+  constructor(track: unknown, public direction: string, encodings: Record<string, unknown>[]) {
+    const sender = {
+      track,
+      replaceCalls: [] as unknown[],
+      params: { encodings: encodings.map((e) => ({ ...e })) } as { encodings: Record<string, unknown>[]; degradationPreference?: string },
+      setCalls: 0,
+      async replaceTrack(t: unknown) {
+        sender.replaceCalls.push(t);
+        sender.track = t;
+      },
+      getParameters() {
+        return JSON.parse(JSON.stringify(sender.params));
+      },
+      async setParameters(p: unknown) {
+        sender.setCalls++;
+        sender.params = JSON.parse(JSON.stringify(p));
+      },
+    };
+    this.sender = sender;
   }
 }

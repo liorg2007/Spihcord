@@ -12,6 +12,7 @@
  */
 import type { IceServer, SignalData } from "@shpihcord/protocol";
 import type {
+  CameraPreference,
   InputMode,
   PeerInfo,
   ScreenSharePreset,
@@ -29,7 +30,20 @@ import { parseStatsReport, parseVideoStats, type LossCounters, type VideoCounter
 import { DEFAULT_VAD_THRESHOLD, VadGate, clamp01 } from "./vad";
 import { mungeLocalSdp, mungeOutgoingSdp } from "./sdp";
 import { CpuWatch, ScreenShareIntents, isStreamSignal, screenEncoding, type StreamAction } from "./screenShare";
-import { codecName, h264Rank, mediaCapabilitiesContentType, orderVideoCodecs, SCREEN_CODEC_ORDER, type CodecLike } from "./codecs";
+import { codecName, h264Rank, mediaCapabilitiesContentType, orderCameraCodecs, orderVideoCodecs, SCREEN_CODEC_ORDER, type CodecLike } from "./codecs";
+import { updateSenderParams } from "./senderParams";
+import {
+  CameraPrefs,
+  CameraSender,
+  cameraEncoding,
+  isCameraPreference,
+  isVideoPrefSignal,
+  labelSdpMsids,
+  receiverKind,
+  sectionKinds,
+  type CameraEncoding,
+  type MediaLabel,
+} from "./camera";
 
 const TICK_MS = 25; // local VAD
 const LEVEL_EVERY_TICKS = 2; // ~20 Hz localLevel
@@ -41,6 +55,31 @@ const SENDER_MAX_BITRATE = 64_000;
 const SCREEN_AUDIO_MAX_BITRATE = 128_000;
 /** Emit remoteScreen even if the video track never reports 'unmute' (UI shows a loading tile). */
 const REMOTE_SCREEN_UNMUTE_FALLBACK_MS = 2_000;
+/** Remote camera liveness polling. */
+const CAMERA_POLL_MS = 250;
+/** No new frames for this long (or track muted this long) -> remoteCamera null. */
+const CAMERA_IDLE_MS = 1_500;
+
+/** A remote camera we are receiving on one peer connection. */
+interface RemoteCamera {
+  transceiver: RTCRtpTransceiver;
+  track: MediaStreamTrack;
+  /** Non-null while announced via remoteCamera. */
+  stream: MediaStream | null;
+  lastSsrcTs?: number;
+  lastPacketAt?: number;
+  mutedSince?: number;
+  dispose(): void;
+}
+
+interface LocalCamera {
+  stream: MediaStream;
+  track: MediaStreamTrack;
+  deviceId: string | undefined;
+  height: number | undefined;
+}
+
+type CodecPrefs = { recv: CodecLike[] | null; send: CodecLike[] | null; cameraRecv: CodecLike[] | null; cameraSend: CodecLike[] | null };
 
 /** Our outgoing screen share on one peer connection. */
 interface ScreenSend {
@@ -56,6 +95,7 @@ interface ScreenSend {
 /** A remote screen share we are receiving on one peer connection. */
 interface RemoteScreen {
   track: MediaStreamTrack;
+  mid: string | null;
   stream: MediaStream | null;
   dispose(): void;
 }
@@ -70,6 +110,9 @@ interface PeerEntry {
   screenSend?: ScreenSend;
   remoteScreen?: RemoteScreen;
   videoCounters?: VideoCounters;
+  camSend?: CameraSender;
+  remoteCam?: RemoteCamera;
+  camCounters?: VideoCounters;
 }
 
 interface LocalShare {
@@ -78,8 +121,6 @@ interface LocalShare {
   audio: MediaStreamTrack | null;
   preset: ScreenSharePreset;
 }
-
-type AnyParams = RTCRtpSendParameters;
 
 type Timer = ReturnType<typeof setInterval>;
 
@@ -116,8 +157,17 @@ export class VoiceCallImpl implements VoiceCall {
   private screenMsid: MediaStream | null = null;
   private readonly streamVolumes = new Map<string, number>();
   private lastViewers = "";
-  private codecPrefs: Promise<{ recv: CodecLike[] | null; send: CodecLike[] | null }> | undefined;
-  private codecPrefsResolved: { recv: CodecLike[] | null; send: CodecLike[] | null } | undefined;
+  private codecPrefs: Promise<CodecPrefs> | undefined;
+  private codecPrefsResolved: CodecPrefs | undefined;
+
+  // camera
+  private camera: LocalCamera | null = null;
+  private cameraGen = 0;
+  private cameraStarting: { deviceId: string | undefined; promise: Promise<void> } | null = null;
+  private cameraDeviceId: string | undefined;
+  private camMsid: MediaStream | null = null;
+  private readonly camPrefs = new CameraPrefs();
+  private camTimer: Timer | undefined;
 
   constructor(private readonly options: VoiceCallOptions) {
     this.selfId = options.selfId;
@@ -139,6 +189,7 @@ export class VoiceCallImpl implements VoiceCall {
     this.installGestureResume();
 
     this.statsTimer = setInterval(() => this.pollStats(), STATS_INTERVAL_MS);
+    this.camTimer = setInterval(() => this.pollRemoteCameras(), CAMERA_POLL_MS);
 
     if (options.outputDeviceId) {
       this.setOutputDevice(options.outputDeviceId).catch((err) =>
@@ -177,6 +228,7 @@ export class VoiceCallImpl implements VoiceCall {
     for (const id of removed) this.removePeer(id);
     const now = Date.now();
     for (const id of added) this.createPeer(id, this.buffer.take(id, now));
+    if (added.length || removed.length) this.tuneAllCameras(); // group size changed
   }
 
   setMuted(muted: boolean): void {
@@ -329,12 +381,90 @@ export class VoiceCallImpl implements VoiceCall {
     if (!this.closed) this.audio.setStreamGain(userId, v);
   }
 
+  // ---------------------------------------------------------------------------
+  // Camera (public)
+
+  startCamera(deviceId?: string): Promise<void> {
+    if (this.closed) return Promise.reject(new Error("Voice call is closed"));
+    if (this.camera) {
+      if (deviceId === undefined || deviceId === this.camera.deviceId) return Promise.resolve();
+      return this.setCameraDevice(deviceId);
+    }
+    if (this.cameraStarting && (deviceId === undefined || deviceId === this.cameraStarting.deviceId)) return this.cameraStarting.promise;
+    if (deviceId !== undefined) this.cameraDeviceId = deviceId;
+    const want = this.cameraDeviceId;
+    const gen = ++this.cameraGen;
+    // eslint-disable-next-line prefer-const
+    let promise: Promise<void> | undefined;
+    promise = (async () => {
+      try {
+        const stream = await captureCamera(want, deviceId !== undefined);
+        await this.ensureCodecPrefs();
+        if (this.closed || gen !== this.cameraGen) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        this.installCamera(stream, want);
+      } finally {
+        if (this.cameraStarting?.promise === promise) this.cameraStarting = null;
+      }
+    })();
+    this.cameraStarting = { deviceId: want, promise };
+    return promise;
+  }
+
+  stopCamera(): void {
+    this.cameraGen++;
+    this.cameraStarting = null;
+    const cam = this.camera;
+    if (!cam) return;
+    this.camera = null;
+    cam.track.onended = null;
+    for (const e of this.peers.values()) e.camSend?.detach();
+    cam.stream.getTracks().forEach((t) => t.stop());
+    cam.track.stop();
+    if (!this.closed) this.emitter.emit("localCamera", { stream: null });
+  }
+
+  isCameraOn(): boolean {
+    return !!this.camera;
+  }
+
+  async setCameraDevice(deviceId: string): Promise<void> {
+    this.cameraDeviceId = deviceId;
+    const cam = this.camera;
+    if (this.closed || !cam || cam.deviceId === deviceId) return;
+    const gen = ++this.cameraGen;
+    const stream = await captureCamera(deviceId, true);
+    if (this.closed || gen !== this.cameraGen || this.camera !== cam) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    cam.track.onended = null;
+    this.installCamera(stream, deviceId); // replaceTrack on every sender
+    cam.stream.getTracks().forEach((t) => t.stop());
+    cam.track.stop();
+  }
+
+  setCameraPreference(userId: string, preference: CameraPreference): void {
+    if (this.closed || !userId || userId === this.selfId || !isCameraPreference(preference)) return;
+    const wasOff = this.camPrefs.local(userId) === "off";
+    const signal = this.camPrefs.setLocal(userId, preference);
+    if (signal && this.peers.has(userId)) this.send(userId, signal);
+    const rc = this.peers.get(userId)?.remoteCam;
+    // Leaving "off": give the sender time to resume before judging the camera idle.
+    if (rc && wasOff && preference !== "off") rc.lastPacketAt = Date.now();
+    // Leaving "off" may need a re-announce; entering "off" suppresses idle nulls.
+    this.checkRemoteCamera(userId);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     if (this.tickTimer) clearInterval(this.tickTimer);
     if (this.statsTimer) clearInterval(this.statsTimer);
-    this.tickTimer = this.statsTimer = undefined;
+    if (this.camTimer) clearInterval(this.camTimer);
+    this.tickTimer = this.statsTimer = this.camTimer = undefined;
     for (const c of this.cleanups.splice(0)) {
       try {
         c();
@@ -344,6 +474,8 @@ export class VoiceCallImpl implements VoiceCall {
     }
     for (const e of this.peers.values()) {
       e.remoteScreen?.dispose();
+      e.remoteCam?.dispose();
+      e.camSend?.close();
       e.peer.close();
     }
     this.peers.clear();
@@ -354,7 +486,15 @@ export class VoiceCallImpl implements VoiceCall {
       this.share.audio?.stop();
       this.share = null;
     }
+    this.cameraGen++;
+    if (this.camera) {
+      this.camera.track.onended = null;
+      this.camera.stream.getTracks().forEach((t) => t.stop());
+      this.camera.track.stop();
+      this.camera = null;
+    }
     this.intents.clear();
+    this.camPrefs.clear();
     this.audio.close();
     this.emitter.clear();
   }
@@ -398,7 +538,7 @@ export class VoiceCallImpl implements VoiceCall {
         localStreams: [this.audio.localStream],
         senderTuning: { maxBitrate: SENDER_MAX_BITRATE, priority: "high" },
         send: (data) => this.send(userId, data),
-        mungeSdp: (sdp) => mungeOutgoingSdp(sdp, peer ? micMid(peer.pc) : null),
+        mungeSdp: (sdp) => labelSdpMsids(mungeOutgoingSdp(sdp, peer ? micMid(peer.pc) : null, peer ? this.cameraMids(peer.pc) : null), this.msidLabels()),
         localSdpTransform: () => {
           if (!peer || !hasScreenAudioTransceiver(peer.pc)) return null;
           const mid = micMid(peer.pc);
@@ -411,13 +551,18 @@ export class VoiceCallImpl implements VoiceCall {
             this.audio.addRemote(userId, stream ?? new MediaStream([track]), this.effectiveGain(userId));
           } else {
             this.refreshRemoteScreen(userId);
+            this.refreshRemoteCamera(userId);
           }
         },
         onNegotiated: () => {
           if (!isCurrent()) return;
           this.refreshRemoteScreen(userId);
+          this.refreshRemoteCamera(userId);
           const e = this.peers.get(userId);
-          if (e) this.tuneScreen(e);
+          if (e) {
+            this.tuneScreen(e);
+            void e.camSend?.retune();
+          }
         },
         onConnectionState: (state) => {
           if (isCurrent()) this.updateInfo(userId, { connectionState: state });
@@ -448,10 +593,13 @@ export class VoiceCallImpl implements VoiceCall {
     };
     this.peers.set(userId, entry);
     this.emitter.emit("peer", { ...entry.info });
+    if (this.camera) this.attachCamera(entry);
     if (this.share && this.intents.shouldSendTo(userId)) this.attachScreen(entry);
     for (const signal of this.intents.signalsForNewPeer(userId)) this.send(userId, signal);
+    for (const signal of this.camPrefs.signalsForNewPeer(userId)) this.send(userId, signal);
     for (const data of replay) {
       if (isStreamSignal(data)) this.onStreamSignal(userId, data.action);
+      else if (isVideoPrefSignal(data)) this.onVideoPref(userId, data.camera);
       else void peer.handleSignal(data);
     }
   }
@@ -461,6 +609,8 @@ export class VoiceCallImpl implements VoiceCall {
     if (!e) return undefined;
     this.peers.delete(userId);
     this.clearRemoteScreen(e, userId);
+    this.clearRemoteCamera(e, userId);
+    e.camSend?.close();
     e.peer.close();
     this.audio.removeRemote(userId);
     if (e.speaking) this.emitter.emit("speaking", { userId, speaking: false });
@@ -469,6 +619,7 @@ export class VoiceCallImpl implements VoiceCall {
 
   private removePeer(userId: string): void {
     this.intents.peerLeft(userId);
+    this.camPrefs.peerLeft(userId);
     if (!this.disposePeer(userId)) return;
     this.buffer.drop(userId);
     this.emitter.emit("peerRemoved", { userId });
@@ -499,6 +650,7 @@ export class VoiceCallImpl implements VoiceCall {
     const e = this.peers.get(from);
     if (!e) this.buffer.push(from, data, Date.now());
     else if (isStreamSignal(data)) this.onStreamSignal(from, data.action);
+    else if (isVideoPrefSignal(data)) this.onVideoPref(from, data.camera);
     else void e.peer.handleSignal(data);
   }
 
@@ -711,13 +863,17 @@ export class VoiceCallImpl implements VoiceCall {
     if (!e || this.closed) return;
     let video: MediaStreamTrack | undefined;
     let audio: MediaStreamTrack | undefined;
+    let videoMid: string | null = null;
     if (this.intents.isWatching(userId) && !e.peer.isClosed) {
       const all = e.peer.pc.getTransceivers();
+      const kinds = sectionKinds(e.peer.pc.currentRemoteDescription?.sdp);
       for (let i = 1; i < all.length; i++) {
         const t = all[i];
         const dir = t.currentDirection;
         if (dir !== "recvonly" && dir !== "sendrecv") continue;
+        if (receiverKind(t.mid, kinds) !== "screen") continue;
         const track = t.receiver.track;
+        if (track?.kind === "video" && !video) videoMid = t.mid;
         if (track?.kind === "video" && !video) video = track;
         else if (track?.kind === "audio" && !audio) audio = track;
       }
@@ -734,6 +890,7 @@ export class VoiceCallImpl implements VoiceCall {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const rs: RemoteScreen = {
       track,
+      mid: videoMid,
       stream: null,
       dispose: () => {
         track.removeEventListener("unmute", emit);
@@ -766,31 +923,246 @@ export class VoiceCallImpl implements VoiceCall {
   }
 
   private handleVideoStats(userId: string, e: PeerEntry, report: RTCStatsReport): void {
+    // Screen
     const s = e.screenSend;
     const sending = !!s?.attached && !!this.share;
     const receiving = !!e.remoteScreen?.stream;
     if (!sending && !receiving) {
       e.videoCounters = undefined;
-      return;
-    }
-    const v = parseVideoStats(report, e.videoCounters);
-    e.videoCounters = v.counters;
-    if (sending && v.send && this.share) {
-      const { bytes: _b, ...rest } = v.send;
-      this.emitter.emit("streamStats", { userId: this.selfId, direction: "send", viewerId: userId, ...rest });
-      const next = s!.cpu.update(v.send.qualityLimitation, this.share.preset, Date.now());
-      if (next) {
-        console.warn(
-          `[call-engine] encoder CPU-limited for >10s sending to ${userId} at preset ${this.share.preset.id}: ` +
-            `maxFramerate x${next.fpsFactor}, scaleResolutionDownBy ${next.scale}`,
-        );
-        this.tuneScreen(e);
+    } else {
+      const v = parseVideoStats(report, e.videoCounters, {
+        sendMid: sending ? s!.video.mid : null,
+        recvMid: receiving ? e.remoteScreen!.mid : null,
+      });
+      e.videoCounters = v.counters;
+      if (sending && v.send && this.share) {
+        const { bytes: _b, ...rest } = v.send;
+        this.emitter.emit("streamStats", { userId: this.selfId, direction: "send", kind: "screen", viewerId: userId, ...rest });
+        const next = s!.cpu.update(v.send.qualityLimitation, this.share.preset, Date.now());
+        if (next) {
+          console.warn(
+            `[call-engine] encoder CPU-limited for >10s sending to ${userId} at preset ${this.share.preset.id}: ` +
+              `maxFramerate x${next.fpsFactor}, scaleResolutionDownBy ${next.scale}`,
+          );
+          this.tuneScreen(e);
+        }
+      }
+      if (receiving && v.recv) {
+        const { bytes: _b, ...rest } = v.recv;
+        this.emitter.emit("streamStats", { userId, direction: "recv", kind: "screen", ...rest });
       }
     }
-    if (receiving && v.recv) {
-      const { bytes: _b, ...rest } = v.recv;
-      this.emitter.emit("streamStats", { userId, direction: "recv", ...rest });
+    // Camera
+    const camSending = !!this.camera && !!e.camSend?.isAttached && !!e.camSend.transceiver?.mid;
+    const camReceiving = !!e.remoteCam?.stream;
+    if (!camSending && !camReceiving) {
+      e.camCounters = undefined;
+      return;
     }
+    const c = parseVideoStats(report, e.camCounters, {
+      sendMid: camSending ? e.camSend!.transceiver!.mid : null,
+      recvMid: camReceiving ? e.remoteCam!.transceiver.mid : null,
+    });
+    e.camCounters = c.counters;
+    if (camSending && c.send) {
+      const { bytes: _b, ...rest } = c.send;
+      this.emitter.emit("streamStats", { userId: this.selfId, direction: "send", kind: "camera", viewerId: userId, ...rest });
+    }
+    if (camReceiving && c.recv) {
+      const { bytes: _b, ...rest } = c.recv;
+      this.emitter.emit("streamStats", { userId, direction: "recv", kind: "camera", ...rest });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Camera (internals)
+
+  private camMsidStream(): MediaStream {
+    this.camMsid ??= new MediaStream();
+    return this.camMsid;
+  }
+
+  /** Real local msid stream id -> kind, for labelling outgoing SDP. */
+  private msidLabels(): Map<string, MediaLabel> {
+    const m = new Map<string, MediaLabel>();
+    try {
+      m.set(this.audio.localStream.id, "mic");
+    } catch {
+      /* ignore */
+    }
+    if (this.camMsid) m.set(this.camMsid.id, "camera");
+    if (this.screenMsid) m.set(this.screenMsid.id, "screen");
+    return m;
+  }
+
+  /** mids of camera m-lines on this connection (ours and the remote's). */
+  private cameraMids(pc: RTCPeerConnection): Set<string> {
+    const out = new Set<string>();
+    try {
+      const kinds = sectionKinds(pc.currentRemoteDescription?.sdp ?? pc.remoteDescription?.sdp);
+      for (const [mid, k] of kinds) if (k === "camera") out.add(mid);
+      for (const e of this.peers.values()) {
+        const mid = e.peer.pc === pc ? e.camSend?.transceiver?.mid : null;
+        if (mid) out.add(mid);
+      }
+    } catch {
+      /* ignore */
+    }
+    return out;
+  }
+
+  private installCamera(stream: MediaStream, deviceId: string | undefined): void {
+    const track = stream.getVideoTracks()[0];
+    if (!track) {
+      stream.getTracks().forEach((t) => t.stop());
+      throw new Error("Camera stream has no video track");
+    }
+    try {
+      track.contentHint = "motion";
+    } catch {
+      /* ignore */
+    }
+    const settings = track.getSettings?.() ?? {};
+    this.camera = { stream, track, deviceId: settings.deviceId ?? deviceId, height: settings.height };
+    track.onended = () => this.onLocalCameraEnded(track);
+    this.emitter.emit("localCamera", { stream });
+    for (const e of this.peers.values()) this.attachCamera(e);
+  }
+
+  private cameraEncodingFor(userId: string): CameraEncoding {
+    return cameraEncoding(this.camera?.height, this.peers.size + 1, this.camPrefs.remote(userId));
+  }
+
+  private attachCamera(e: PeerEntry): void {
+    const cam = this.camera;
+    if (!cam || e.peer.isClosed) return;
+    try {
+      e.camSend ??= new CameraSender({
+        pc: e.peer.pc,
+        msid: this.camMsidStream(),
+        onTransceiver: (t) => this.applyCodecPreferences(t, "camera"),
+        onError: (message, cause) => {
+          if (this.peers.get(e.info.userId) === e) console.warn(`[call-engine] ${message} (${e.info.userId})`, cause);
+        },
+      });
+      e.camSend.attach(cam.track, this.cameraEncodingFor(e.info.userId));
+    } catch (err) {
+      this.emitError(`Failed to send camera to ${e.info.userId}`, err);
+    }
+  }
+
+  private tuneAllCameras(): void {
+    if (!this.camera) return;
+    for (const [userId, e] of this.peers) if (e.camSend?.isAttached) void e.camSend.tune(this.cameraEncodingFor(userId));
+  }
+
+  private onVideoPref(from: string, pref: CameraPreference): void {
+    if (!isCameraPreference(pref)) return;
+    this.camPrefs.onRemote(from, pref);
+    const e = this.peers.get(from);
+    if (e?.camSend && this.camera) void e.camSend.tune(this.cameraEncodingFor(from));
+  }
+
+  private onLocalCameraEnded(track: MediaStreamTrack): void {
+    if (this.closed || this.camera?.track !== track) return;
+    this.stopCamera();
+    this.emitter.emit("localCameraEnded", {});
+  }
+
+  /** Find the receiving camera transceiver of `userId` (or none) and (re)bind to it. */
+  private refreshRemoteCamera(userId: string): void {
+    const e = this.peers.get(userId);
+    if (!e || this.closed) return;
+    let found: RTCRtpTransceiver | undefined;
+    if (!e.peer.isClosed) {
+      const all = e.peer.pc.getTransceivers();
+      const kinds = sectionKinds(e.peer.pc.currentRemoteDescription?.sdp);
+      for (let i = 1; i < all.length; i++) {
+        const t = all[i];
+        const dir = t.currentDirection;
+        if (dir !== "recvonly" && dir !== "sendrecv") continue;
+        if (t.receiver.track?.kind !== "video" || receiverKind(t.mid, kinds) !== "camera") continue;
+        found = t;
+        break;
+      }
+    }
+    const cur = e.remoteCam;
+    if (cur && found && cur.transceiver === found && cur.track === found.receiver.track) {
+      this.checkRemoteCamera(userId);
+      return;
+    }
+    if (cur) this.clearRemoteCamera(e, userId);
+    if (!found) return;
+    const track = found.receiver.track;
+    const onChange = () => this.checkRemoteCamera(userId);
+    const rc: RemoteCamera = {
+      transceiver: found,
+      track,
+      stream: null,
+      dispose: () => {
+        track.removeEventListener("mute", onChange);
+        track.removeEventListener("unmute", onChange);
+      },
+    };
+    track.addEventListener("mute", onChange);
+    track.addEventListener("unmute", onChange);
+    e.remoteCam = rc;
+    this.checkRemoteCamera(userId);
+  }
+
+  private pollRemoteCameras(): void {
+    if (this.closed) return;
+    for (const [userId, e] of this.peers) if (e.remoteCam) this.checkRemoteCamera(userId);
+  }
+
+  /** Announce / withdraw a remote camera from its liveness (frames arriving, track not muted). */
+  private checkRemoteCamera(userId: string): void {
+    const e = this.peers.get(userId);
+    const rc = e?.remoteCam;
+    if (!e || !rc || this.closed) return;
+    const now = Date.now();
+    const track = rc.track;
+    if (track.muted) rc.mutedSince ??= now;
+    else rc.mutedSince = undefined;
+
+    let recent: boolean;
+    const getSrc = (rc.transceiver.receiver as RTCRtpReceiver).getSynchronizationSources;
+    if (typeof getSrc === "function") {
+      let newest: number | undefined;
+      try {
+        for (const s of getSrc.call(rc.transceiver.receiver)) if (newest === undefined || s.timestamp > newest) newest = s.timestamp;
+      } catch {
+        /* ignore */
+      }
+      if (newest !== undefined && newest !== rc.lastSsrcTs) {
+        if (rc.lastSsrcTs !== undefined || !track.muted) rc.lastPacketAt = now;
+        rc.lastSsrcTs = newest;
+      }
+      recent = rc.lastPacketAt !== undefined && now - rc.lastPacketAt < CAMERA_IDLE_MS;
+    } else {
+      recent = !track.muted;
+    }
+    const mutedLong = rc.mutedSince !== undefined && now - rc.mutedSince >= CAMERA_IDLE_MS;
+    const live = recent && !mutedLong && track.readyState === "live";
+
+    if (!rc.stream && live) {
+      rc.stream = new MediaStream([track]);
+      this.emitter.emit("remoteCamera", { userId, stream: rc.stream });
+    } else if (rc.stream && !live && this.camPrefs.local(userId) !== "off") {
+      // While we asked for "off", nothing arrives by design: keep the stream (frozen).
+      rc.stream = null;
+      e.camCounters = undefined;
+      this.emitter.emit("remoteCamera", { userId, stream: null });
+    }
+  }
+
+  private clearRemoteCamera(e: PeerEntry, userId: string): void {
+    const rc = e.remoteCam;
+    if (!rc) return;
+    e.remoteCam = undefined;
+    e.camCounters = undefined;
+    rc.dispose();
+    if (rc.stream) this.emitter.emit("remoteCamera", { userId, stream: null });
   }
 
   /** Compute (once) the video codec preference order, probing hardware encoders. */
@@ -802,10 +1174,11 @@ export class VoiceCallImpl implements VoiceCall {
     return this.codecPrefs;
   }
 
-  private applyCodecPreferences(t: RTCRtpTransceiver): void {
+  private applyCodecPreferences(t: RTCRtpTransceiver, kind: "screen" | "camera" = "screen"): void {
     const prefs = this.codecPrefsResolved;
     if (!prefs || typeof t.setCodecPreferences !== "function") return;
-    for (const list of [prefs.recv, prefs.send]) {
+    const lists = kind === "camera" ? [prefs.cameraRecv, prefs.cameraSend] : [prefs.recv, prefs.send];
+    for (const list of lists) {
       if (!list) continue;
       try {
         t.setCodecPreferences(list as RTCRtpCodec[]);
@@ -910,27 +1283,6 @@ async function applyVideoPreset(track: MediaStreamTrack, preset: ScreenSharePres
   }
 }
 
-/** getParameters -> mutate -> setParameters; retries without degradationPreference if rejected. */
-async function updateSenderParams(
-  sender: RTCRtpSender,
-  mutate: (p: AnyParams) => void,
-  degradationPreference?: RTCDegradationPreference,
-): Promise<boolean> {
-  for (const withPref of degradationPreference ? [true, false] : [false]) {
-    const p = sender.getParameters() as AnyParams;
-    if (!p.encodings || p.encodings.length === 0) return false; // not negotiated yet; retried later
-    mutate(p);
-    if (withPref) p.degradationPreference = degradationPreference;
-    try {
-      await sender.setParameters(p);
-      return true;
-    } catch (err) {
-      if (!withPref) throw err;
-    }
-  }
-  return false;
-}
-
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -940,10 +1292,17 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
   }
 }
 
-async function computeCodecPrefs(): Promise<{ recv: CodecLike[] | null; send: CodecLike[] | null }> {
+/** getUserMedia for the camera (720p30 ideal). `exact` rejects if that device is unavailable. */
+async function captureCamera(deviceId: string | undefined, exact: boolean): Promise<MediaStream> {
+  const video: MediaTrackConstraints = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+  if (deviceId) video.deviceId = exact ? { exact: deviceId } : { ideal: deviceId };
+  return navigator.mediaDevices.getUserMedia({ video, audio: false });
+}
+
+async function computeCodecPrefs(): Promise<CodecPrefs> {
   const recvCaps = (globalThis.RTCRtpReceiver?.getCapabilities?.("video")?.codecs ?? null) as CodecLike[] | null;
   const sendCaps = (globalThis.RTCRtpSender?.getCapabilities?.("video")?.codecs ?? null) as CodecLike[] | null;
-  if (!recvCaps || !sendCaps) return { recv: null, send: null };
+  if (!recvCaps || !sendCaps) return { recv: null, send: null, cameraRecv: null, cameraSend: null };
   const sendable = new Set(sendCaps.map((c) => codecName(c.mimeType)));
 
   // Hardware encoders: mediaCapabilities.encodingInfo(...).powerEfficient.
@@ -982,5 +1341,7 @@ async function computeCodecPrefs(): Promise<{ recv: CodecLike[] | null; send: Co
       .map((c) => codecName(c.mimeType) + (c.sdpFmtpLine?.includes("profile-level-id") ? `(${/profile-level-id=(\w+)/.exec(c.sdpFmtpLine)?.[1]})` : ""))
       .join(" > ")}; hardware: [${[...hardware].join(",") || "none"}]`,
   );
-  return { recv, send };
+  const cameraRecv = orderCameraCodecs(recvCaps, hardware, sendable);
+  const cameraSend = orderCameraCodecs(sendCaps, hardware, sendable);
+  return { recv, send, cameraRecv, cameraSend };
 }

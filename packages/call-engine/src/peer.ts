@@ -84,6 +84,8 @@ export class Peer {
   private closed = false;
   private resetRequested = false;
   private senderTuned = false;
+  /** We (polite) rolled back a local offer: Chromium can leave the mic send stream stopped. */
+  private rolledBack = false;
   private micSender: RTCRtpSender | undefined;
   private initialOfferTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -128,7 +130,12 @@ export class Peer {
     };
     pc.onconnectionstatechange = () => this.handleConnectionState();
     pc.onsignalingstatechange = () => {
-      if (!this.closed && this.pc.signalingState === "stable") this.opts.onNegotiated?.();
+      if (this.closed || this.pc.signalingState !== "stable") return;
+      if (this.rolledBack) {
+        this.rolledBack = false;
+        void this.kickMicSender();
+      }
+      this.opts.onNegotiated?.();
     };
 
     if (opts.localTrack) {
@@ -178,6 +185,8 @@ export class Peer {
       const offerCollision = description.type === "offer" && !readyForOffer;
       this.ignoreOffer = !this.polite && offerCollision;
       if (this.ignoreOffer) return;
+      // Only a renegotiation rollback (not the initial glare) has been seen to stall the mic.
+      if (offerCollision && pc.currentLocalDescription) this.rolledBack = true;
 
       this.isSettingRemoteAnswerPending = description.type === "answer";
       try {
@@ -363,6 +372,37 @@ export class Peer {
     if (this.teardownTimer) clearTimeout(this.teardownTimer);
     this.disconnectTimer = undefined;
     this.teardownTimer = undefined;
+  }
+
+  /**
+   * After an implicit rollback Chromium may recreate the mic's send stream (new
+   * SSRC, parameters reset) without starting it: re-apply the track and the
+   * sender parameters, which restarts it.
+   */
+  private async kickMicSender(): Promise<void> {
+    const sender = this.micSender;
+    if (!sender || this.closed || typeof sender.getParameters !== "function") return;
+    // Encodings are empty until Chromium re-creates the send stream; wait for that.
+    for (let i = 0; i < 50 && !this.closed; i++) {
+      try {
+        if ((sender.getParameters().encodings?.length ?? 0) > 0) break;
+      } catch {
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (this.closed) return;
+    try {
+      const track = sender.track;
+      if (track) {
+        await sender.replaceTrack(null);
+        await sender.replaceTrack(track);
+      }
+    } catch {
+      /* best effort */
+    }
+    this.senderTuned = false;
+    if (this.pc.connectionState === "connected") await this.tuneSender();
   }
 
   private async tuneSender(): Promise<void> {

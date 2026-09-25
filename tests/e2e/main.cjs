@@ -21,9 +21,11 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const DIST = path.join(__dirname, "dist");
-const HARD_TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS || 240_000);
+const HARD_TIMEOUT_MS = Number(process.env.E2E_TIMEOUT_MS || 480_000);
 /** E2E_SCREEN_ONLY=1 skips the voice scenarios 2-6 (for iterating on screen share). */
 const SCREEN_ONLY = !!process.env.E2E_SCREEN_ONLY;
+/** E2E_CAMERA_ONLY=1 runs only the mesh precondition + camera scenarios. */
+const CAMERA_ONLY = !!process.env.E2E_CAMERA_ONLY;
 const VERBOSE = !!process.env.E2E_VERBOSE;
 
 app.commandLine.appendSwitch("use-fake-device-for-media-stream");
@@ -384,8 +386,9 @@ async function main() {
     ...(m1.ok && !VERBOSE ? [] : await debugDump(trio, stuckNames(m1.status, trio))),
   ]);
 
-  if (!SCREEN_ONLY) await voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming });
-  await screenScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+  if (!SCREEN_ONLY && !CAMERA_ONLY) await voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming });
+  if (!CAMERA_ONLY) await screenScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+  await cameraScenarios({ all, trio, A, B, C, D, E, byId, hangout });
 
   for (const c of all) {
     try {
@@ -898,6 +901,339 @@ async function screenScenarios({ all, trio, A, B, C, D, E, byId, hangout }) {
     });
     await drainAll(all);
     record("screen 7: voice still flows on every leg after screen-share renegotiations", ok, [...fmtMesh(m2.status), ...lines, ...errorsOf(trio)]);
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// camera scenarios
+
+const fmtCam = (v) => (v ? `${v.w ?? "?"}x${v.h ?? "?"}@${v.fps ?? "?"}fps ${v.codec ? v.codec.split(" ")[0] : "?"}` : "none");
+
+async function camRate(rx, txId, ms) {
+  const a = (await rx.call("cameraStats"))[txId]?.in;
+  await sleep(ms);
+  const b = (await rx.call("cameraStats"))[txId]?.in;
+  return { bytes: (b?.bytes ?? 0) - (a?.bytes ?? 0), frames: (b?.framesDecoded ?? 0) - (a?.framesDecoded ?? 0), kbps: rateKbps(a, b), last: b };
+}
+
+/** Poll until the inbound camera from tx at rx is stable in height (or timeout). */
+async function settleCam(rx, txId, ms) {
+  const deadline = now() + ms;
+  let last = null;
+  let same = 0;
+  while (now() < deadline) {
+    const v = (await rx.call("cameraStats"))[txId]?.in;
+    if (v?.h && last?.h === v.h) same++;
+    else same = 0;
+    last = v;
+    if (same >= 4) break;
+    await sleep(500);
+  }
+  return last;
+}
+
+async function cameraScenarios({ all, trio, A, B, C, D, E, byId, hangout }) {
+  for (const c of [D, E]) await c.call("leave");
+  let m = await waitMesh(trio, 15_000);
+  if (!m.ok) {
+    for (const c of trio) await c.call("join", hangout);
+    m = await waitMesh(trio, 15_000);
+  }
+  await drainAll(all);
+  await drainAll(all);
+    for (const c of all) c.events = [];
+  if (!m.ok) {
+    record("camera: precondition 3-peer mesh", false, fmtMesh(m.status));
+    return;
+  }
+  const name = (id) => byId.get(id) || id;
+  const others = [B, C];
+
+  // C1. alice turns on the camera -> bob & carol get it ---------------------------------
+  {
+    const t0 = now();
+    const started = await A.call("startCamera");
+    const got = {};
+    try {
+      await waitFor(
+        async () => {
+          await drainAll(all);
+          for (const rx of others) if (got[rx.name] == null && lastEv(rx, "remoteCamera", (e) => e.userId === A.id && e.stream)) got[rx.name] = now() - t0;
+          return others.every((rx) => got[rx.name] != null);
+        },
+        8000,
+        "remoteCamera(alice)",
+        100,
+      );
+    } catch {}
+    const settled = await Promise.all(others.map((rx) => settleCam(rx, A.id, 8000)));
+    const rates = await Promise.all(others.map((rx) => camRate(rx, A.id, 1500)));
+    const aStats = await A.call("cameraStats");
+    await drainAll(all);
+    const lines = [`alice capture: ${started.settings?.width}x${started.settings?.height}@${started.settings?.frameRate} contentHint=${started.contentHint}`];
+    let ok = true;
+    others.forEach((rx, i) => {
+      const fast = got[rx.name] != null && got[rx.name] <= 3500;
+      const flowing = rates[i].frames > 10;
+      if (!fast || !flowing) ok = false;
+      const out = aStats[rx.id];
+      lines.push(
+        `${rx.name}: remoteCamera after ${got[rx.name] ?? "never"} ms; inbound ${fmtCam(rates[i].last)} ~${kb(rates[i].kbps)} kbps (+${rates[i].frames} frames/1.5s) ${fast && flowing ? "" : "<-- FAIL"}`,
+        `   alice->${rx.name} out ${fmtCam(out?.out)} qlr=${out?.out?.qlr} params ${JSON.stringify(out?.params)}`,
+      );
+    });
+    const sendStats = lastEv(A, "streamStats", (e) => e.kind === "camera" && e.direction === "send");
+    const recvStats = lastEv(B, "streamStats", (e) => e.kind === "camera" && e.direction === "recv");
+    lines.push(`engine streamStats camera send: ${JSON.stringify(sendStats && { ...sendStats, t: undefined, type: undefined, userId: name(sendStats.userId), viewerId: name(sendStats.viewerId) })}`);
+    lines.push(`engine streamStats camera recv (bob): ${JSON.stringify(recvStats && { ...recvStats, t: undefined, type: undefined, userId: name(recvStats.userId) })}`);
+    if (!sendStats?.viewerId || !recvStats) ok = false;
+    lines.push(...errorsOf(trio));
+    record("camera 1: alice camera on -> bob & carol get remoteCamera with live video (3 people: 720p tier)", ok, lines);
+  }
+
+  // C2. off -> null, capture ended, no renegotiation; on again -> back, no renegotiation ----------
+  {
+    await drainAll(all);
+    for (const c of all) c.events = [];
+    const offers0 = await Promise.all(trio.map((c) => c.call("cameraState").then((s) => s.offers)));
+    const t = now();
+    const stopped = await A.call("stopCamera");
+    const nulls = {};
+    try {
+      await waitFor(
+        async () => {
+          await drainAll(all);
+          for (const rx of others) if (nulls[rx.name] == null && lastEv(rx, "remoteCamera", (e) => e.userId === A.id && !e.stream)) nulls[rx.name] = now() - t;
+          return others.every((rx) => nulls[rx.name] != null);
+        },
+        5000,
+        "remoteCamera null",
+        100,
+      );
+    } catch {}
+    const localNull = !!lastEv(A, "localCamera", (e) => !e.stream);
+    await sleep(1000);
+    const offers1 = await Promise.all(trio.map((c) => c.call("cameraState").then((s) => s.offers)));
+    await drainAll(all);
+    for (const c of all) c.events = [];
+    const t2 = now();
+    await A.call("startCamera");
+    const back = {};
+    try {
+      await waitFor(
+        async () => {
+          await drainAll(all);
+          for (const rx of others) if (back[rx.name] == null && lastEv(rx, "remoteCamera", (e) => e.userId === A.id && e.stream)) back[rx.name] = now() - t2;
+          return others.every((rx) => back[rx.name] != null);
+        },
+        5000,
+        "remoteCamera back",
+        100,
+      );
+    } catch {}
+    const flowing = await camRate(B, A.id, 1500);
+    await sleep(500);
+    const offers2 = await Promise.all(trio.map((c) => c.call("cameraState").then((s) => s.offers)));
+    const noReneg = offers0.every((o, i) => o === offers1[i] && o === offers2[i]);
+    const ok = others.every((rx) => nulls[rx.name] != null && back[rx.name] != null) && stopped.lastTrackState === "ended" && !stopped.on && localNull && noReneg && flowing.frames > 10;
+    record("camera 2: off -> null + capture track ended, on again -> back; no renegotiation either way", ok, [
+      `off: null at ${others.map((rx) => `${rx.name}=${nulls[rx.name] ?? "never"}ms`).join(" ")}; alice capture track readyState=${stopped.lastTrackState}; localCamera(null)=${localNull}`,
+      `on:  stream at ${others.map((rx) => `${rx.name}=${back[rx.name] ?? "never"}ms`).join(" ")}; bob decoding +${flowing.frames} frames/1.5s ${fmtCam(flowing.last)}`,
+      `offers (sent+received) alice/bob/carol: before ${offers0.join("/")}, after off ${offers1.join("/")}, after on ${offers2.join("/")} -> renegotiation: ${noReneg ? "none" : "YES"}`,
+      ...errorsOf(trio),
+    ]);
+  }
+
+  // C3. per-viewer preference ---------------------------------------------------------------
+  {
+    await drainAll(all);
+    for (const c of all) c.events = [];
+    await B.call("setCameraPreference", A.id, "off");
+    await sleep(1500);
+    const [bOff, cOff] = await Promise.all([camRate(B, A.id, 2000), camRate(C, A.id, 2000)]);
+    const paramsOff = (await A.call("cameraStats"))[B.id]?.params?.enc;
+    await drainAll(all);
+    const bobNullWhileOff = evs(B, "remoteCamera", (e) => e.userId === A.id && !e.stream).length;
+    await B.call("setCameraPreference", A.id, "low");
+    await sleep(1000);
+    const low = await settleCam(B, A.id, 8000);
+    const lowRate = await camRate(B, A.id, 2000);
+    const paramsLow = (await A.call("cameraStats"))[B.id]?.params?.enc;
+    const carolDuringLow = await camRate(C, A.id, 1000);
+    await B.call("setCameraPreference", A.id, "high");
+    await sleep(1000);
+    const high = await settleCam(B, A.id, 10_000);
+    const highRate = await camRate(B, A.id, 1500);
+    const paramsHigh = (await A.call("cameraStats"))[B.id]?.params?.enc;
+    const ok =
+      bOff.frames === 0 && bOff.bytes < 25_000 && // no media; BWE padding/probing may still arrive
+      cOff.frames > 10 &&
+      paramsOff?.active === false &&
+      (lowRate.last?.h ?? 999) <= 200 &&
+      lowRate.frames > 5 &&
+      (lowRate.kbps ?? 999) < 250 &&
+      (highRate.last?.h ?? 0) > 200 &&
+      highRate.frames > 10 &&
+      carolDuringLow.last?.h > 200;
+    record("camera 3: bob's preference for alice: off -> ~0 bytes (carol unaffected), low -> <=~200p, high -> restored", ok, [
+      `off:  bob +${bOff.bytes} B/+${bOff.frames} frames in 2s; carol +${cOff.frames} frames ${fmtCam(cOff.last)}; alice enc->bob ${JSON.stringify(paramsOff)}; bob remoteCamera null events while off: ${bobNullWhileOff}`,
+      `low:  bob ${fmtCam(lowRate.last)} ~${kb(lowRate.kbps)} kbps (+${lowRate.frames} frames/2s); alice enc->bob ${JSON.stringify(paramsLow)}; carol meanwhile ${fmtCam(carolDuringLow.last)}`,
+      `high: bob ${fmtCam(highRate.last)} ~${kb(highRate.kbps)} kbps; alice enc->bob ${JSON.stringify(paramsHigh)}`,
+      ...errorsOf(trio),
+    ]);
+  }
+
+  // C4. camera + screen share from the same user ----------------------------------------------
+  {
+    await drainAll(all);
+    for (const c of all) c.events = [];
+    await A.call("startShare", "balanced");
+    await B.call("watch", A.id, true);
+    let ok = false;
+    const lines = [];
+    try {
+      await waitEvent(all, B, "remoteScreen", (e) => e.userId === A.id && e.stream, 6000, "bob remoteScreen");
+    } catch {}
+    await sleep(2000);
+    const id = await B.call("identify", A.id);
+    const camR = await camRate(B, A.id, 1500);
+    const scr = (await B.call("mediaStats"))[A.id];
+    const an = await B.call("analyseScreenAudio", A.id, 2000);
+    const audio = await B.call("sampleAudio", 2000);
+    await drainAll(all);
+    const camNulls = evs(B, "remoteCamera", (e) => e.userId === A.id && !e.stream).length;
+    const camTrail = evs(B, "remoteCamera", (e) => e.userId === A.id).map((e) => `${e.stream ? "on" : "null"}@${e.t}`).join(" ");
+    const shareAt = lastEv(B, "remoteScreen", (e) => e.userId === A.id && e.stream)?.t;
+    const micOk = !!audio[A.id] && audio[A.id].bytes > 0;
+    ok =
+      id.distinct &&
+      id.cameraMidMatches &&
+      id.screenMidMatches &&
+      String(id.cameraMsid[0]).startsWith("cam-") &&
+      String(id.screenMsid[0]).startsWith("scr-") &&
+      String(id.micMsid[0]).startsWith("mic-") &&
+      camR.frames > 10 &&
+      (scr?.videoIn?.framesDecoded ?? 0) > 0 &&
+      camNulls === 0 &&
+      !an.error &&
+      an.screenAudioSameMsidAsVideo &&
+      an.micMsidDiffers &&
+      micOk;
+    lines.push(
+      `bob receives from alice: camera track ${id.cameraTrack} msid ${JSON.stringify(id.cameraMsid)} | screen track ${id.screenTrack} msid ${JSON.stringify(id.screenMsid)} | distinct=${id.distinct}`,
+      `mids ${JSON.stringify(id.mids)}; camera mid matches=${id.cameraMidMatches}, screen mid matches=${id.screenMidMatches}`,
+      `mic msid ${JSON.stringify(id.micMsid)}; screen audio msid ${JSON.stringify(id.screenAudioMsid)}; screen audio tone L=${an.leftHz}Hz R=${an.rightHz}Hz`,
+      `camera still decoding: +${camR.frames} frames/1.5s ${fmtCam(camR.last)}; screen inbound ${fmtVideo(scr?.videoIn)}; camera null blips: ${camNulls} (trail ${camTrail}; screen arrived @${shareAt})`,
+      `mic from alice at bob: ${fmtAudio(audio[A.id])}`,
+      ...errorsOf(trio),
+    );
+    record("camera 4: camera + screen share from alice at once -> bob gets both, correctly identified; screen audio separate from mic", ok, lines);
+    await B.call("watch", A.id, false);
+    await A.call("stopShare");
+    await sleep(1000);
+  }
+
+  // C5. five people with cameras -> 480p tier -----------------------------------------------------
+  {
+    for (const c of [D, E]) await c.call("join", hangout);
+    const m5 = await waitMesh(all, 25_000);
+    for (const c of [B, C, D, E]) await c.call("startCamera");
+    // Each receiver should see 4 remote cameras.
+    let allCams = false;
+    try {
+      await waitFor(
+        async () => {
+          for (const rx of all) {
+            const st = await rx.call("cameraState");
+            if (st.remote.filter(([, on]) => on).length !== 4) return false;
+          }
+          return true;
+        },
+        15_000,
+        "everyone sees 4 cameras",
+        300,
+      );
+      allCams = true;
+    } catch {}
+    await sleep(6000);
+    const lines = [`mesh: ${m5.ok ? "complete" : "INCOMPLETE"}; everyone sees 4 remote cameras: ${allCams}`];
+    let ok = m5.ok && allCams;
+    for (const tx of all) {
+      const st = await tx.call("cameraStats");
+      const row = [];
+      for (const rx of all) {
+        if (rx === tx) continue;
+        const r = st[rx.id];
+        const enc = r?.params?.enc;
+        const good = enc && enc.maxBitrate === 800_000 && enc.maxFramerate === 30 && (r?.out?.h ?? 999) <= 480 && enc.active !== false;
+        if (!good) ok = false;
+        row.push(`->${rx.name} ${fmtCam(r?.out)} [maxBitrate=${enc?.maxBitrate} maxFps=${enc?.maxFramerate} scale=${enc?.scaleResolutionDownBy}]${good ? "" : " <--"}`);
+      }
+      lines.push(`${tx.name}: ${row.join(" | ")}`);
+    }
+    const recv = await B.call("cameraStats");
+    lines.push(`bob inbound: ${all.filter((c) => c !== B).map((c) => `${c.name}=${fmtCam(recv[c.id]?.in)}`).join(" ")}`);
+    lines.push(...errorsOf(all));
+    record("camera 5: 5 people with cameras on -> every per-viewer cap at the 480p tier (800 kbps, 30 fps)", ok, lines);
+  }
+
+  // C6. late joiner gets the existing cameras immediately -------------------------------------------
+  {
+    await E.call("leave");
+    await waitFor(async () => (await E.peers()).length === 0, 5000, "erin out");
+    await sleep(800);
+    await drainAll(all);
+    await drainAll(all);
+    for (const c of all) c.events = [];
+    const t = now();
+    await E.call("join", hangout);
+    const got = {};
+    try {
+      await waitFor(
+        async () => {
+          await drainAll([E]);
+          for (const tx of [A, B, C, D]) if (got[tx.name] == null && lastEv(E, "remoteCamera", (e) => e.userId === tx.id && e.stream)) got[tx.name] = now() - t;
+          return [A, B, C, D].every((tx) => got[tx.name] != null);
+        },
+        15_000,
+        "erin gets all cameras",
+        100,
+      );
+    } catch {}
+    await sleep(1500);
+    const rows = await E.call("cameraStats");
+    const ok = [A, B, C, D].every((tx) => got[tx.name] != null && got[tx.name] <= 8000 && (rows[tx.id]?.in?.framesDecoded ?? 0) > 0);
+    record("camera 6: late joiner (erin) receives the 4 existing cameras right away", ok, [
+      `after join: ${[A, B, C, D].map((tx) => `${tx.name}=${got[tx.name] ?? "never"}ms`).join(" ")}`,
+      `erin inbound: ${[A, B, C, D].map((tx) => `${tx.name}=${fmtCam(rows[tx.id]?.in)}`).join(" ")}`,
+      ...errorsOf(all),
+    ]);
+  }
+
+  // C7. everyone off; voice fine --------------------------------------------------------------------
+  {
+    for (const c of all) await c.call("stopCamera");
+    await sleep(3000);
+    await drainAll(all);
+    const states = await Promise.all(all.map((c) => c.call("cameraState")));
+    const leftover = states.map((s, i) => `${all[i].name}: remote on=[${s.remote.filter(([, on]) => on).map(([u]) => name(u))}] local tracks=${s.localTracks.join(",")}`);
+    const samples = await Promise.all(trio.map((c) => c.call("sampleAudio", 2000)));
+    let ok = states.every((s) => !s.on && s.remote.every(([, on]) => !on) && s.localTracks.every((r) => r === "ended"));
+    const lines = [...leftover];
+    trio.forEach((rx, i) => {
+      for (const tx of trio) {
+        if (tx === rx) continue;
+        const s = samples[i][tx.id];
+        const good = !!s && s.bytes > 0 && (s.maxLevel > 0.01 || s.meterPeak > 0.01);
+        if (!good) ok = false;
+        lines.push(`${rx.name} <- ${tx.name}: ${fmtAudio(s)} ${good ? "" : "<-- no audio"}`);
+      }
+    });
+    if (!ok || VERBOSE) for (const c of trio) lines.push(...(await c.call("pcSummary")).map((l) => `${c.name} (t0): ${l.replace(/[0-9A-Z]{26}/g, (id) => name(id))}`));
+    if (!ok || VERBOSE) await sleep(1000);
+    if (!ok || VERBOSE) for (const c of trio) lines.push(...(await c.call("pcSummary")).map((l) => `${c.name}: ${l.replace(/[0-9A-Z]{26}/g, (id) => name(id))}`));
+    record("camera 7: all cameras off -> no remote cameras, all capture tracks ended; voice still flows", ok, [...lines, ...errorsOf(all)]);
   }
 }
 

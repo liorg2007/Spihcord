@@ -26,7 +26,17 @@ let pcSeq = 0;
 const sigLog: string[] = [];
 const ms = () => Math.round(performance.now());
 const sigDesc = (d: SignalData) =>
-  d.kind === "description" ? `desc:${d.description.type}` : d.kind === "stream" ? `stream:${d.action}` : d.candidate ? "cand" : "cand:end";
+  d.kind === "description"
+    ? `desc:${d.description.type}`
+    : d.kind === "stream"
+      ? `stream:${d.action}`
+      : d.kind === "video-pref"
+        ? `video-pref:${d.camera}`
+        : d.candidate
+          ? "cand"
+          : "cand:end";
+/** Offers sent + received (renegotiation counter). */
+let offerCount = 0;
 
 // Independent level meter per remote user (own AudioContext, analyser only, not played).
 let meterCtx: AudioContext | null = null;
@@ -144,6 +154,7 @@ function onServer(msg: ServerMessage): void {
       return;
     case "rtc.signal":
       if (msg.data.kind === "description" && msg.data.description.sdp) sdpSender.set(msg.data.description.sdp, msg.from);
+      if (msg.data.kind === "description" && msg.data.description.type === "offer") offerCount++;
       sigLog.push(`${ms()} <- ${msg.from} ${sigDesc(msg.data)}`);
       for (const h of signalHandlers) h(msg.from, msg.data);
       return;
@@ -207,6 +218,7 @@ async function init(opts: { hubUrl: string; username: string; password: string; 
     signaling: {
       send: (to, data) => {
         sigLog.push(`${ms()} -> ${to} ${sigDesc(data)}`);
+        if (data.kind === "description" && data.description.type === "offer") offerCount++;
         wsSend({ type: "rtc.signal", to, data });
       },
       onSignal: (h) => {
@@ -232,6 +244,16 @@ async function init(opts: { hubUrl: string; username: string; password: string; 
   call.on("viewers", ({ userIds }) => log("viewers", { userIds }));
   call.on("streamStats", (st) => log("streamStats", { ...st }));
   call.on("localScreenEnded", () => log("localScreenEnded"));
+  call.on("remoteCamera", ({ userId, stream }) => {
+    remoteCameras.set(userId, stream);
+    const v = stream?.getVideoTracks()[0];
+    log("remoteCamera", { userId, stream: !!stream, tracks: stream ? stream.getTracks().map((t) => `${t.kind}:${t.readyState}`).join(",") : "", videoTrackId: v?.id ?? null, streamId: stream?.id ?? null });
+  });
+  call.on("localCamera", ({ stream }) => {
+    if (stream) localCamTracks.push(stream.getVideoTracks()[0]);
+    log("localCamera", { stream: !!stream });
+  });
+  call.on("localCameraEnded", () => log("localCameraEnded"));
   let maxLocal = 0;
   call.on("localLevel", ({ level }) => {
     if (level > maxLocal) maxLocal = level;
@@ -561,14 +583,15 @@ async function mediaStats() {
     const report = await pc.getStats();
     const tr = pc.getTransceivers();
     const micMid = tr[0]?.mid;
+    const m = engineMids(pc.__remoteUser);
     const row: any = { videoIn: null, videoOut: null, screenAudioOut: null, screenAudioIn: null, transceivers: tr.map((t) => `${t.mid}:${t.receiver.track.kind}:${t.direction}/${t.currentDirection}`).join(" ") };
     report.forEach((s: any) => {
       const kind = s.kind ?? s.mediaType;
-      if (s.type === "inbound-rtp" && kind === "video") {
+      if (s.type === "inbound-rtp" && kind === "video" && (m.scrIn ? s.mid === m.scrIn : s.mid !== m.camIn)) {
         row.videoIn = { bytes: s.bytesReceived, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, framesDecoded: s.framesDecoded, codec: codecOf(report, s), decoder: s.decoderImplementation, ts: s.timestamp };
-      } else if (s.type === "outbound-rtp" && kind === "video") {
+      } else if (s.type === "outbound-rtp" && kind === "video" && (m.scrOut ? s.mid === m.scrOut : s.mid !== m.camOut)) {
         row.videoOut = { bytes: s.bytesSent, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, framesSent: s.framesSent, codec: codecOf(report, s), encoder: s.encoderImplementation, powerEfficient: s.powerEfficientEncoder, qlr: s.qualityLimitationReason, target: s.targetBitrate, ts: s.timestamp };
-      } else if (s.type === "media-source" && kind === "video") {
+      } else if (s.type === "media-source" && kind === "video" && !row.videoSource) {
         row.videoSource = { w: s.width, h: s.height, fps: s.framesPerSecond, frames: s.frames };
       } else if (s.type === "outbound-rtp" && kind === "audio" && s.mid !== micMid) {
         row.screenAudioOut = { bytes: s.bytesSent, codec: codecOf(report, s), target: s.targetBitrate, ts: s.timestamp, mid: s.mid };
@@ -576,7 +599,7 @@ async function mediaStats() {
         row.screenAudioIn = { bytes: s.bytesReceived, codec: codecOf(report, s), ts: s.timestamp, mid: s.mid };
       }
     });
-    const vs = tr.find((t, i) => i > 0 && t.sender.track?.kind === "video");
+    const vs = tr.find((t, i) => i > 0 && t.sender.track?.kind === "video" && t.mid !== m.camOut);
     if (vs) {
       const p = vs.sender.getParameters() as any;
       row.videoSenderParams = { enc: p.encodings?.[0], degradationPreference: p.degradationPreference };
@@ -584,6 +607,125 @@ async function mediaStats() {
     out[pc.__remoteUser] = row;
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Camera
+
+const remoteCameras = new Map<string, MediaStream | null>();
+const localCamTracks: MediaStreamTrack[] = [];
+
+/** mids of the screen/camera transceivers on our connection to `userId` (engine internals). */
+function engineMids(userId: string) {
+  const e = (call as any)?.peers?.get(userId);
+  return {
+    scrOut: (e?.screenSend?.video?.mid ?? null) as string | null,
+    scrIn: (e?.remoteScreen?.mid ?? null) as string | null,
+    camOut: (e?.camSend?.transceiver?.mid ?? null) as string | null,
+    camIn: (e?.remoteCam?.transceiver?.mid ?? null) as string | null,
+  };
+}
+
+async function startCamera(deviceId?: string) {
+  await call!.startCamera(deviceId);
+  const t = localCamTracks[localCamTracks.length - 1];
+  return { on: call!.isCameraOn(), settings: t?.getSettings() ?? null, contentHint: t?.contentHint };
+}
+
+function stopCamera() {
+  call!.stopCamera();
+  return { on: call!.isCameraOn(), lastTrackState: localCamTracks[localCamTracks.length - 1]?.readyState ?? null };
+}
+
+async function setCameraDevice(deviceId: string) {
+  await call!.setCameraDevice(deviceId);
+  return localCamTracks.map((t) => t.readyState);
+}
+
+async function cameraDevices() {
+  return (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput").map((d) => ({ id: d.deviceId, label: d.label }));
+}
+
+function setCameraPreference(userId: string, pref: "off" | "low" | "high") {
+  call!.setCameraPreference(userId, pref);
+}
+
+/** Camera RTP stats per remote user (only the camera mids), plus our sender parameters. */
+async function cameraStats() {
+  const out: Record<string, any> = {};
+  for (const pc of allPcs) {
+    if (pc.connectionState === "closed" || pc.signalingState === "closed" || !pc.__remoteUser) continue;
+    const m = engineMids(pc.__remoteUser);
+    const report = await pc.getStats();
+    const row: any = { in: null, out: null, params: null, mids: m };
+    report.forEach((s: any) => {
+      if ((s.kind ?? s.mediaType) !== "video") return;
+      if (s.type === "inbound-rtp" && m.camIn && s.mid === m.camIn) {
+        row.in = { bytes: s.bytesReceived ?? 0, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, framesDecoded: s.framesDecoded ?? 0, codec: codecOf(report, s), ts: s.timestamp };
+      } else if (s.type === "outbound-rtp" && m.camOut && s.mid === m.camOut) {
+        row.out = { bytes: s.bytesSent ?? 0, w: s.frameWidth, h: s.frameHeight, fps: s.framesPerSecond, codec: codecOf(report, s), qlr: s.qualityLimitationReason, active: s.active, ts: s.timestamp };
+      }
+    });
+    const t = pc.getTransceivers().find((x) => x.mid === m.camOut);
+    if (t) {
+      const p = t.sender.getParameters() as any;
+      row.params = { enc: p.encodings?.[0], degradationPreference: p.degradationPreference };
+    }
+    out[pc.__remoteUser] = row;
+  }
+  return out;
+}
+
+/** What we receive from `userId`: camera vs screen streams and their msid stream ids. */
+function identify(userId: string) {
+  const cam = remoteCameras.get(userId) ?? null;
+  const scr = remoteScreens.get(userId) ?? null;
+  const pc = livePcFor(userId);
+  const tr = pc?.getTransceivers() ?? [];
+  const camT = cam?.getVideoTracks()[0];
+  const scrT = scr?.getVideoTracks()[0];
+  const m = engineMids(userId);
+  return {
+    cameraTrack: camT?.id ?? null,
+    screenTrack: scrT?.id ?? null,
+    distinct: !!camT && !!scrT && camT !== scrT,
+    cameraMsid: camT ? trackStreams.get(camT.id) ?? [] : [],
+    screenMsid: scrT ? trackStreams.get(scrT.id) ?? [] : [],
+    micMsid: tr[0] ? trackStreams.get(tr[0].receiver.track.id) ?? [] : [],
+    screenAudioMsid: tr.filter((t, i) => i > 0 && t.receiver.track.kind === "audio").map((t) => trackStreams.get(t.receiver.track.id) ?? []),
+    mids: m,
+    cameraMidMatches: !!camT && tr.find((t) => t.mid === m.camIn)?.receiver.track === camT,
+    screenMidMatches: !!scrT && tr.find((t) => t.mid === m.scrIn)?.receiver.track === scrT,
+  };
+}
+
+async function pcSummary() {
+  const out: string[] = [];
+  for (const pc of allPcs) {
+    let micIn = -1;
+    let micOut = -1;
+    const extra: string[] = [];
+    try {
+      const r = await pc.getStats();
+      const mid = pc.getTransceivers()[0]?.mid;
+      r.forEach((s: any) => {
+        if (s.type === "inbound-rtp" && (s.kind ?? s.mediaType) === "audio" && s.mid === mid) micIn = s.bytesReceived;
+        if (s.type === "outbound-rtp" && (s.kind ?? s.mediaType) === "audio" && s.mid === mid) micOut = s.bytesSent;
+        if (s.type === "outbound-rtp" && (s.kind ?? s.mediaType) === "audio") extra.push(`out(mid=${s.mid} ssrc=${s.ssrc} bytes=${s.bytesSent} active=${s.active})`);
+      });
+    } catch {}
+    out.push(`pc${pc.__id}(${pc.__remoteUser ?? "?"}) ${pc.connectionState}/${pc.signalingState} micIn=${micIn} micOut=${micOut} ${extra.join(" ")} micSender=${pc.signalingState === "closed" ? "-" : JSON.stringify({ track: pc.getTransceivers()[0]?.sender.track?.readyState, enc: pc.getTransceivers()[0]?.sender.getParameters().encodings })} tr=${pc.signalingState === "closed" ? "-" : pc.getTransceivers().map((t) => `${t.mid}:${t.receiver.track.kind}:${t.currentDirection}`).join(" ")}`);
+  }
+  return out;
+}
+
+function cameraState() {
+  return {
+    on: call?.isCameraOn() ?? false,
+    offers: offerCount,
+    localTracks: localCamTracks.map((t) => t.readyState),
+    remote: [...remoteCameras].map(([u, s]) => [u, !!s]),
+  };
 }
 
 function dominantHz(analyser: AnalyserNode, buf: Float32Array<ArrayBuffer>): { hz: number; db: number } {
@@ -604,7 +746,8 @@ async function analyseScreenAudio(userId: string, durationMs: number) {
   const tr = pc.getTransceivers();
   const mic = tr[0]?.receiver.track;
   const screenT = tr.find((t, i) => i > 0 && t.receiver.track.kind === "audio" && (t.currentDirection === "recvonly" || t.currentDirection === "sendrecv"));
-  const video = tr.find((t, i) => i > 0 && t.receiver.track.kind === "video" && (t.currentDirection === "recvonly" || t.currentDirection === "sendrecv"));
+  const scrMid = engineMids(userId).scrIn;
+  const video = tr.find((t, i) => i > 0 && t.receiver.track.kind === "video" && (scrMid ? t.mid === scrMid : true) && (t.currentDirection === "recvonly" || t.currentDirection === "sendrecv"));
   if (!screenT) return { error: "no screen audio transceiver", transceivers: tr.map((t) => `${t.mid}:${t.receiver.track.kind}:${t.currentDirection}`) };
   const ctx = new AudioContext({ sampleRate: 48000 });
   await ctx.resume();
@@ -745,5 +888,14 @@ function setDeafened(d: boolean) {
   probeRemoteVideo,
   screenState,
   forceReset,
+  startCamera,
+  stopCamera,
+  setCameraDevice,
+  cameraDevices,
+  setCameraPreference,
+  cameraStats,
+  identify,
+  cameraState,
+  pcSummary,
 };
 (window as any).harnessLoaded = true;
