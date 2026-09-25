@@ -5,7 +5,7 @@ import { joinVoice } from "../lib/voice";
 import { displayNameOf, setApp, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { HashIcon, HeadphonesOffIcon, MicOffIcon, SpeakerIcon } from "./Icons";
+import { HashIcon, HeadphonesOffIcon, LogoMark, MicOffIcon, SpeakerIcon } from "./Icons";
 import { popoverTriggerProps } from "./UserPopover";
 import { LiveBadge } from "./Stream";
 import { UserPanel } from "./UserPanel";
@@ -28,7 +28,9 @@ export function ChannelSidebar() {
   return (
     <aside className="sidebar">
       <header className="sidebar-header" title={serverUrl}>
-        <div className="sidebar-title">Shpihcord</div>
+        <div className="sidebar-title">
+          <LogoMark size={20} /> Shpihcord
+        </div>
         <div className="sidebar-subtitle">{hostOf(serverUrl)}</div>
       </header>
       <nav className="channel-list">

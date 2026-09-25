@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { reconnectNow } from "../lib/session";
 import { useApp } from "../store/app";
 import { useSettings } from "../store/settings";
-import { ChatIcon, HashIcon, SpeakerIcon, UsersIcon } from "./Icons";
+import { ChatIcon, HashIcon, LogoMark, SpeakerIcon, UsersIcon } from "./Icons";
 import { VoiceView } from "./VoiceView";
 
 export function MainArea() {
@@ -18,7 +18,10 @@ export function MainArea() {
             <h2 className="main-title">{channel.name}</h2>
           </>
         ) : (
-          <h2 className="main-title">Shpihcord</h2>
+          <>
+            <LogoMark size={24} className="header-icon" />
+            <h2 className="main-title">Shpihcord</h2>
+          </>
         )}
         <div className="header-spacer" />
         <button

@@ -10,7 +10,7 @@ import { setApp, useApp } from "../store/app";
 import { StreamVideo } from "./Stream";
 import { useSettings, type Settings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { KeyboardIcon, LogOutIcon, MicIcon, ShieldIcon, VideoOffIcon, WarningIcon, XIcon } from "./Icons";
+import { KeyboardIcon, LogoMark, LogOutIcon, MicIcon, ShieldIcon, VideoOffIcon, WarningIcon, XIcon } from "./Icons";
 
 type Tab = "voice" | "account";
 
@@ -45,7 +45,7 @@ export function SettingsModal() {
             Log Out <LogOutIcon size={16} />
           </button>
           <div className="settings-version">
-            Shpihcord {version || "…"} · {bridge.platform}
+            <LogoMark size={16} /> Shpihcord {version || "…"} · {bridge.platform}
           </div>
         </nav>
       </div>
