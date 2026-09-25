@@ -9,7 +9,7 @@ export function ServerRail() {
       <div className="rail-item active" title={`Shpihcord — ${hostOf(serverUrl)}`}>
         <span className="rail-pill" />
         <div className="rail-icon">
-          <LogoMark size={26} />
+          <LogoMark size={38} />
         </div>
       </div>
       <div className="rail-sep" />

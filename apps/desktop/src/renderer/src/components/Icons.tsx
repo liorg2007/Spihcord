@@ -147,11 +147,56 @@ export const ChatIcon = (p: IconProps) => (
   </Svg>
 );
 
-/** The app logo: a stylized "S" wave inside the rail icon. */
-export const LogoMark = (p: IconProps) => (
-  <Svg {...p} strokeWidth={2.4}>
-    <path d="M17 7.5c-1-1.6-2.8-2.5-5-2.5-2.8 0-5 1.5-5 3.7 0 4.8 10 2.6 10 7.3 0 2.2-2.2 3.5-5 3.5-2.3 0-4.2-1-5.2-2.7" />
-  </Svg>
+const LOGO_BUBBLE =
+  "M256 72c-112 0-200 72-200 164 0 52 28 98 72 128l-18 70c-2 8 6 14 13 10l78-44c17 4 36 6 55 6 112 0 200-72 200-170S368 72 256 72z";
+const LOGO_DROPS = [
+  "M130 118c0 0-22 26-22 40a22 22 0 0 0 44 0c0-14-22-40-22-40z",
+  "M388 128c0 0-14 17-14 26a14 14 0 0 0 28 0c0-9-14-26-14-26z",
+  "M404 262c0 0-18 21-18 32a18 18 0 0 0 36 0c0-11-18-32-18-32z",
+  "M96 250c0 0-11 13-11 20a11 11 0 0 0 22 0c0-7-11-20-11-20z",
+  "M300 96c0 0-9 11-9 17a9 9 0 0 0 18 0c0-6-9-17-9-17z",
+  "M168 330c0 0-12 14-12 21a12 12 0 0 0 24 0c0-7-12-21-12-21z",
+];
+
+/** The app logo (assets/logo.svg): a chat bubble with a cute face and white drops. */
+export const LogoMark = ({ size = 20, ...rest }: IconProps) => (
+  <svg width={size} height={size} viewBox="43 48 420 420" aria-hidden="true" {...rest}>
+    <defs>
+      <linearGradient id="logo-grad" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stopColor="#7C5CFF" />
+        <stop offset="1" stopColor="#4F7BFF" />
+      </linearGradient>
+      <clipPath id="logo-clip">
+        <path d={LOGO_BUBBLE} />
+      </clipPath>
+    </defs>
+    <path d={LOGO_BUBBLE} fill="url(#logo-grad)" />
+    <g fill="#fff" opacity={0.9} clipPath="url(#logo-clip)">
+      {LOGO_DROPS.map((d) => (
+        <path key={d} d={d} />
+      ))}
+    </g>
+    <g fill="#1E1B3A">
+      <ellipse cx="198" cy="220" rx="20" ry="26" />
+      <ellipse cx="314" cy="220" rx="20" ry="26" />
+    </g>
+    <g fill="#fff">
+      <circle cx="205" cy="210" r="7" />
+      <circle cx="321" cy="210" r="7" />
+    </g>
+    <g fill="#FF8FB1" opacity={0.8}>
+      <ellipse cx="164" cy="262" rx="20" ry="11" />
+      <ellipse cx="348" cy="262" rx="20" ry="11" />
+    </g>
+    <path
+      d="M232 262q12 16 24 0q12 16 24 0"
+      fill="none"
+      stroke="#1E1B3A"
+      strokeWidth={9}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
 );
 
 export const ScreenShareIcon = (p: IconProps) => (

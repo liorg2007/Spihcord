@@ -34,15 +34,15 @@ header.write("icns", 0, "ascii");
 header.writeUInt32BE(body.length + 8, 4);
 writeFileSync(join(build, "icon.icns"), Buffer.concat([header, body]));
 
-// Tray icons: the bubble without the tile, cropped tight so it reads at 16-22px.
+// Window + tray icons: the bubble without the tile, cropped tight so it reads at 16-22px.
 const trayDir = join(root, "resources");
 mkdirSync(trayDir, { recursive: true });
 const traySvg = Buffer.from(
   svg.toString()
     .replace(/<rect x="100"[^>]*\/>/, "")
-    .replace('viewBox="0 0 1024 1024"', 'viewBox="200 220 624 624"'),
+    .replace('viewBox="0 0 1024 1024"', 'viewBox="195 200 624 624"'),
 );
-for (const [name, size] of [["tray.png", 32], ["tray@2x.png", 64], ["tray-16.png", 16], ["tray-22.png", 22]]) {
+for (const [name, size] of [["icon.png", 256], ["tray.png", 32], ["tray@2x.png", 64], ["tray-16.png", 16], ["tray-22.png", 22]]) {
   writeFileSync(join(trayDir, name), await png(size, traySvg));
 }
 console.log("icons written to build/ and resources/");

@@ -68,7 +68,7 @@ export function LoginScreen() {
       <div className="login-bg" aria-hidden="true" />
       <form className="login-card" onSubmit={submit} noValidate>
         <div className="login-logo">
-          <LogoMark size={30} />
+          <LogoMark size={44} />
         </div>
         <h1>{isRegister ? "Create an account" : "Welcome back!"}</h1>
         <p className="login-sub">

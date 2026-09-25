@@ -39,29 +39,12 @@ function isHttpUrl(url: string): boolean {
   }
 }
 
-/** A blurple circle icon drawn in code (no asset files), BGRA bitmap. */
+/** The logo bubble at `size` px, from the PNGs `npm run icons` writes to resources/. */
 function makeIcon(size: number): Electron.NativeImage {
-  const buf = Buffer.alloc(size * size * 4);
-  const c = (size - 1) / 2;
-  const rOuter = size / 2 - 0.5;
-  const rInner = size * 0.2;
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      const d = Math.hypot(x - c, y - c);
-      const outerA = Math.max(0, Math.min(1, rOuter - d + 0.5));
-      const innerA = Math.max(0, Math.min(1, rInner - d + 0.5));
-      // blurple #5865f2 blended with white centre dot
-      const r = 0x58 + (0xff - 0x58) * innerA;
-      const g = 0x65 + (0xff - 0x65) * innerA;
-      const b = 0xf2 + (0xff - 0xf2) * innerA;
-      const i = (y * size + x) * 4;
-      buf[i] = Math.round(b * outerA);
-      buf[i + 1] = Math.round(g * outerA);
-      buf[i + 2] = Math.round(r * outerA);
-      buf[i + 3] = Math.round(255 * outerA);
-    }
-  }
-  return nativeImage.createFromBitmap(buf, { width: size, height: size });
+  const dir = app.isPackaged ? process.resourcesPath : join(app.getAppPath(), "resources");
+  const file = size <= 16 ? "tray-16.png" : size <= 22 ? "tray-22.png" : "icon.png";
+  const img = nativeImage.createFromPath(join(dir, file));
+  return img.isEmpty() ? img : img.resize({ width: size, height: size, quality: "best" });
 }
 
 function showWindow(): void {

@@ -37,7 +37,7 @@ function Splash({ text, sub, actions }: { text: string; sub?: string; actions?: 
   return (
     <div className="splash">
       <div className="splash-logo">
-        <LogoMark size={44} />
+        <LogoMark size={64} />
       </div>
       <div className="splash-text">{text}</div>
       {sub && <div className="splash-sub">{sub}</div>}
