@@ -35,7 +35,9 @@ export class FakePC {
   onconnectionstatechange: (() => void) | null = null;
   onsignalingstatechange: (() => void) | null = null;
 
-  readonly fingerprint = `sha-256 AA:${++fpCounter}`;
+  /** A per-instance DTLS identity, or the long-term one from config.certificates (see fakeCertificate). */
+  readonly fingerprint: string;
+  readonly sessionId = String(1000 + ++fpCounter);
   readonly addedCandidates: unknown[] = [];
   readonly receivedTracks: string[] = [];
   closed = false;
@@ -53,6 +55,8 @@ export class FakePC {
   constructor(config: RTCConfiguration, opDelay: () => number = () => 0) {
     this.config = config;
     this.opDelay = opDelay;
+    const cert = config.certificates?.[0] as unknown as { __fp?: string } | undefined;
+    this.fingerprint = cert?.__fp ?? fakeFingerprint(fpCounter);
     FakePC.instances.push(this);
   }
 
@@ -81,6 +85,14 @@ export class FakePC {
   }
 
   setConfiguration(config: RTCConfiguration): void {
+    // Chromium: changing the certificates of an existing connection throws.
+    const was = this.config.certificates ?? [];
+    const now = config.certificates ?? [];
+    if (was.length !== now.length || was.some((c, i) => c !== now[i])) {
+      const e = new Error("InvalidModificationError: certificates changed");
+      e.name = "InvalidModificationError";
+      throw e;
+    }
     this.config = config;
   }
 
@@ -193,7 +205,7 @@ export class FakePC {
     if (offer && this.restartPending) this.iceGen++;
     return [
       "v=0",
-      "o=- 1 2 IN IP4 127.0.0.1",
+      `o=- ${this.sessionId} 2 IN IP4 127.0.0.1`,
       `a=fingerprint:${this.fingerprint}`,
       `a=ice-ufrag:u${this.iceGen}`,
       "m=audio 9 UDP/TLS/RTP/SAVPF 111",
@@ -271,6 +283,19 @@ export class FakePC {
       this.onicecandidate?.({ candidate: null });
     }, 0);
   }
+}
+
+/** A well-formed sha-256 fingerprint derived from `n`. */
+export function fakeFingerprint(n: number): string {
+  const bytes = Array.from({ length: 32 }, (_, i) => (i === 0 ? (n >> 8) & 0xff : i === 1 ? n & 0xff : (n * 131 + i * 17) & 0xff).toString(16).toUpperCase().padStart(2, "0"));
+  return `sha-256 ${bytes.join(":")}`;
+}
+
+/** A stand-in RTCCertificate with a fixed identity (pass in config.certificates). */
+export function fakeCertificate(n: number): RTCCertificate {
+  const fp = fakeFingerprint(n);
+  const [algorithm, value] = fp.split(" ");
+  return { __fp: fp, expires: Date.now() + 1e10, getFingerprints: () => [{ algorithm, value }] } as unknown as RTCCertificate;
 }
 
 function invalidState(msg: string): Error {

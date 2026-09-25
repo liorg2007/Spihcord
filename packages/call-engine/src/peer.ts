@@ -5,6 +5,7 @@
  */
 import type { SignalData } from "@shpihcord/protocol";
 import { extractFingerprint, mungeOpusForVoice } from "./sdp";
+import { extractSessionId, parseDtlsFingerprint } from "./identity";
 
 export type PcFactory = (config: RTCConfiguration) => RTCPeerConnection;
 
@@ -31,7 +32,17 @@ export const DEFAULT_PEER_TIMINGS: PeerTimings = {
   politeInitialOfferDelayMs: 3_000,
 };
 
-export type ResetReason = "failed" | "connect-timeout" | "remote-restarted" | "negotiation-error";
+export type ResetReason = "failed" | "connect-timeout" | "remote-restarted" | "negotiation-error" | "identity-retry";
+
+export type IdentityEvent =
+  | { status: "trusted"; fingerprint: string }
+  | { status: "mismatch"; expected: string; received: string; reason: "changed" | "invalid" };
+
+/** A remote description held back by an identity mismatch, plus the candidates that followed it. */
+export interface BlockedSignals {
+  description: SignalData;
+  candidates: SignalData[];
+}
 
 export interface SenderTuning {
   maxBitrate?: number;
@@ -58,6 +69,12 @@ export interface PeerOptions {
    * the remote side started a new session).
    */
   onReset?(reason: ResetReason, replay?: SignalData[]): void;
+  /**
+   * Identity check before any remote description is applied (see
+   * VoiceCallOptions.verifyFingerprint). Unset = no pinning (legacy behavior).
+   */
+  verifyFingerprint?: (fingerprint: string) => { trusted: true } | { trusted: false; expected: string };
+  onIdentity?(event: IdentityEvent): void;
   /** Transform outgoing SDP (default: Opus voice munging). */
   mungeSdp?: (sdp: string) => string;
   /**
@@ -88,6 +105,9 @@ export class Peer {
   private rolledBack = false;
   private micSender: RTCRtpSender | undefined;
   private initialOfferTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Set while an identity mismatch holds this connection back: nothing remote is applied. */
+  private blocked: BlockedSignals | null = null;
+  private trustedFingerprint: string | undefined;
 
   private disconnectTimer: Timer | undefined;
   private teardownTimer: Timer | undefined;
@@ -155,11 +175,31 @@ export class Peer {
     return this.closed;
   }
 
+  get isBlocked(): boolean {
+    return !!this.blocked;
+  }
+
+  /** The remote fingerprint accepted by verifyFingerprint, if any. */
+  get remoteFingerprint(): string | undefined {
+    return this.trustedFingerprint;
+  }
+
+  /** Hand over (and forget) the signals held back by an identity mismatch. */
+  takeBlocked(): BlockedSignals | null {
+    const b = this.blocked;
+    this.blocked = null;
+    return b;
+  }
+
   /** Feed a signal received from this peer. Never rejects. */
   async handleSignal(data: SignalData): Promise<void> {
     if (this.closed) return;
     const pc = this.pc;
     if (data.kind === "candidate") {
+      if (this.blocked) {
+        if (this.blocked.candidates.length < 256) this.blocked.candidates.push(data);
+        return;
+      }
       try {
         if (data.candidate) await pc.addIceCandidate(data.candidate);
         else await pc.addIceCandidate();
@@ -185,6 +225,7 @@ export class Peer {
       const offerCollision = description.type === "offer" && !readyForOffer;
       this.ignoreOffer = !this.polite && offerCollision;
       if (this.ignoreOffer) return;
+      if (!this.checkIdentity(data)) return;
       // Only a renegotiation rollback (not the initial glare) has been seen to stall the mic.
       if (offerCollision && pc.currentLocalDescription) this.rolledBack = true;
 
@@ -207,6 +248,38 @@ export class Peer {
         this.opts.onError?.(`Failed to apply ${description.type} from ${this.userId}`, err);
       }
     }
+  }
+
+  /**
+   * Runs the identity hook on a description we are about to apply. Returns
+   * false (and blocks the peer) when it must not be applied.
+   */
+  private checkIdentity(data: SignalData & { kind: "description" }): boolean {
+    const verify = this.opts.verifyFingerprint;
+    if (!verify) return true;
+    const parsed = parseDtlsFingerprint(data.description.sdp);
+    let event: IdentityEvent;
+    if (!parsed.ok) {
+      event = { status: "mismatch", expected: this.trustedFingerprint ?? "", received: parsed.reason, reason: "invalid" };
+    } else {
+      const verdict = verify(parsed.fingerprint);
+      if (verdict.trusted) {
+        const wasBlocked = !!this.blocked;
+        this.blocked = null; // e.g. the remote went back to its pinned key
+        if (wasBlocked) this.armTeardown("connect-timeout", this.timings.connectTimeoutMs);
+        if (this.trustedFingerprint !== parsed.fingerprint) {
+          this.trustedFingerprint = parsed.fingerprint;
+          this.opts.onIdentity?.({ status: "trusted", fingerprint: parsed.fingerprint });
+        }
+        return true;
+      }
+      event = { status: "mismatch", expected: verdict.expected, received: parsed.fingerprint, reason: "changed" };
+    }
+    // Hold everything back: no remote description means no DTLS, so no media.
+    this.blocked = { description: data, candidates: [] };
+    this.clearTimers();
+    this.opts.onIdentity?.(event);
+    return false;
   }
 
   restartIce(): void {
@@ -251,12 +324,12 @@ export class Peer {
   // ---------------------------------------------------------------------------
 
   private async negotiate(force = false): Promise<void> {
-    if (this.closed) return;
+    if (this.closed || this.blocked) return;
     if (!force && this.polite && !this.pc.currentRemoteDescription && !this.pc.currentLocalDescription) {
       // Initial negotiation: let the impolite side offer; fall back to offering ourselves.
       this.initialOfferTimer ??= setTimeout(() => {
         this.initialOfferTimer = undefined;
-        if (!this.closed && !this.pc.currentRemoteDescription && this.pc.signalingState === "stable") {
+        if (!this.closed && !this.blocked && !this.pc.currentRemoteDescription && this.pc.signalingState === "stable") {
           void this.negotiate(true);
         }
       }, this.timings.politeInitialOfferDelayMs);
@@ -308,10 +381,19 @@ export class Peer {
     this.opts.send({ kind: "description", description: { type: desc.type, sdp } });
   }
 
+  /**
+   * The offer comes from a different RTCPeerConnection than the one we are
+   * connected to: a new DTLS identity, or (with long-term certificates, where
+   * the fingerprint survives a recreated connection) a new o= session id.
+   */
   private isForeignSession(sdp: string | undefined): boolean {
-    const current = extractFingerprint(this.pc.currentRemoteDescription?.sdp);
+    const currentSdp = this.pc.currentRemoteDescription?.sdp;
+    const current = extractFingerprint(currentSdp);
     const incoming = extractFingerprint(sdp);
-    return !!current && !!incoming && current !== incoming;
+    if (!!current && !!incoming && current !== incoming) return true;
+    const curSession = extractSessionId(currentSdp);
+    const newSession = extractSessionId(sdp);
+    return !!curSession && !!newSession && curSession !== newSession;
   }
 
   private handleConnectionState(): void {
@@ -351,7 +433,7 @@ export class Peer {
   }
 
   private armTeardown(reason: ResetReason, ms: number): void {
-    if (this.teardownTimer) return;
+    if (this.teardownTimer || this.blocked) return;
     this.teardownTimer = setTimeout(() => {
       this.teardownTimer = undefined;
       if (this.closed || this.pc.connectionState === "connected") return;

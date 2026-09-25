@@ -3,7 +3,7 @@
  * pong, voice.join/leave, rtc.signal relay) driving the real call engine.
  * The Electron main process drives it through `window.harness`.
  */
-import { createVoiceCall, type PeerInfo, type ScreenSharePresetId, type VoiceCall } from "@shpihcord/call-engine";
+import { certificateFingerprint, createVoiceCall, type PeerInfo, type ScreenSharePresetId, type VoiceCall } from "@shpihcord/call-engine";
 import {
   PROTOCOL_VERSION,
   ServerMessageSchema,
@@ -175,8 +175,29 @@ async function http(path: string, body: unknown): Promise<{ status: number; json
   return { status: res.status, json: await res.json() };
 }
 
-async function init(opts: { hubUrl: string; username: string; password: string; invite: string }) {
+// ---------------------------------------------------------------------------
+// Identity pinning (like the desktop app: long-term cert + TOFU pins in memory)
+
+let certificate: RTCCertificate | undefined;
+const pins = new Map<string, string>();
+const lastMismatch = new Map<string, string>();
+
+function genCert(): Promise<RTCCertificate> {
+  return RTCPeerConnection.generateCertificate({ name: "ECDSA", namedCurve: "P-256", expires: 365 * 86400e3 } as EcKeyGenParams);
+}
+
+function verifyFingerprint(userId: string, fp: string) {
+  const pinned = pins.get(userId);
+  if (!pinned) {
+    pins.set(userId, fp);
+    return { trusted: true as const };
+  }
+  return pinned === fp ? { trusted: true as const } : { trusted: false as const, expected: pinned };
+}
+
+async function init(opts: { hubUrl: string; username: string; password: string; invite: string; pinning?: boolean }) {
   hubUrl = opts.hubUrl;
+  if (opts.pinning !== false) certificate = await genCert();
   let r = await http("/api/register", { username: opts.username, password: opts.password, inviteCode: opts.invite });
   if (r.status === 409) r = await http("/api/login", { username: opts.username, password: opts.password });
   if (r.status >= 300) throw new Error(`auth failed ${r.status} ${JSON.stringify(r.json)}`);
@@ -215,6 +236,7 @@ async function init(opts: { hubUrl: string; username: string; password: string; 
   call = createVoiceCall({
     selfId,
     iceServers: ready.iceServers,
+    ...(certificate ? { certificate, verifyFingerprint } : {}),
     signaling: {
       send: (to, data) => {
         sigLog.push(`${ms()} -> ${to} ${sigDesc(data)}`);
@@ -240,6 +262,10 @@ async function init(opts: { hubUrl: string; username: string; password: string; 
       tracks: stream ? stream.getTracks().map((t) => `${t.kind}:${t.readyState}:${t.muted ? "muted" : "live"}`).join(",") : "",
       videoTrackId: v?.id ?? null,
     });
+  });
+  call.on("identityMismatch", (m) => {
+    lastMismatch.set(m.userId, m.received);
+    log("identityMismatch", { ...m });
   });
   call.on("viewers", ({ userIds }) => log("viewers", { userIds }));
   call.on("streamStats", (st) => log("streamStats", { ...st }));
@@ -860,6 +886,32 @@ function forceReset(userId: string) {
   (call as any).resetPeer(userId, "failed", []);
 }
 
+function identity() {
+  return { fingerprint: certificateFingerprint(certificate) ?? null, pins: Object.fromEntries(pins) };
+}
+
+async function safetyNumber(userId: string) {
+  return call!.getSafetyNumber(userId);
+}
+
+/**
+ * Test hook for the MITM scenario: from now on this client presents a different
+ * DTLS key (as a relay substituting its own certificate would) on new connections.
+ */
+async function swapCertificate() {
+  certificate = await genCert();
+  (call as any).certificate = certificate;
+  return certificateFingerprint(certificate);
+}
+
+/** "Trust new key": re-pin to what was presented and retry the blocked connection. */
+function trustPeer(userId: string) {
+  const fp = lastMismatch.get(userId);
+  if (fp) pins.set(userId, fp);
+  call!.retryPeer(userId);
+  return fp ?? null;
+}
+
 function setDeafened(d: boolean) {
   call?.setDeafened(d);
 }
@@ -888,6 +940,10 @@ function setDeafened(d: boolean) {
   probeRemoteVideo,
   screenState,
   forceReset,
+  identity,
+  safetyNumber,
+  swapCertificate,
+  trustPeer,
   startCamera,
   stopCamera,
   setCameraDevice,

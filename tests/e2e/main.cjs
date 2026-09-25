@@ -27,6 +27,8 @@ const SCREEN_ONLY = !!process.env.E2E_SCREEN_ONLY;
 /** E2E_CAMERA_ONLY=1 runs only the mesh precondition + camera scenarios. */
 const CAMERA_ONLY = !!process.env.E2E_CAMERA_ONLY;
 const VERBOSE = !!process.env.E2E_VERBOSE;
+/** E2E_IDENTITY_ONLY=1 runs only the mesh precondition + identity pinning scenarios. */
+const IDENTITY_ONLY = !!process.env.E2E_IDENTITY_ONLY;
 
 app.commandLine.appendSwitch("use-fake-device-for-media-stream");
 app.commandLine.appendSwitch("use-fake-ui-for-media-stream");
@@ -386,9 +388,12 @@ async function main() {
     ...(m1.ok && !VERBOSE ? [] : await debugDump(trio, stuckNames(m1.status, trio))),
   ]);
 
-  if (!SCREEN_ONLY && !CAMERA_ONLY) await voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming });
-  if (!CAMERA_ONLY) await screenScenarios({ all, trio, A, B, C, D, E, byId, hangout });
-  await cameraScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+  if (!IDENTITY_ONLY) {
+    if (!SCREEN_ONLY && !CAMERA_ONLY) await voiceScenarios({ all, trio, A, B, C, byId, hangout, gaming });
+    if (!CAMERA_ONLY) await screenScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+    await cameraScenarios({ all, trio, A, B, C, D, E, byId, hangout });
+  }
+  if (!SCREEN_ONLY && !CAMERA_ONLY) await identityScenarios({ all, trio, A, B, C, hangout });
 
   for (const c of all) {
     try {
@@ -1235,6 +1240,106 @@ async function cameraScenarios({ all, trio, A, B, C, D, E, byId, hangout }) {
     if (!ok || VERBOSE) for (const c of trio) lines.push(...(await c.call("pcSummary")).map((l) => `${c.name}: ${l.replace(/[0-9A-Z]{26}/g, (id) => name(id))}`));
     record("camera 7: all cameras off -> no remote cameras, all capture tracks ended; voice still flows", ok, [...lines, ...errorsOf(all)]);
   }
+}
+
+// ---------------------------------------------------------------------------
+// identity pinning scenarios (every client runs with a long-term cert + TOFU pins)
+
+async function identityScenarios({ all, trio, A, B, C, hangout }) {
+  // Clean slate: only the trio in voice.
+  for (const c of all) await c.call("leave");
+  await waitFor(async () => {
+    for (const c of all) if ((await c.peers()).length !== 0) return false;
+    return true;
+  }, 8000, "everyone out of voice");
+  for (const c of trio) await c.call("join", hangout);
+  const m0 = await waitMesh(trio, 15_000);
+  await drainAll(all);
+  for (const c of all) c.events = [];
+
+  // I1. pins = the peers' real certificates; safety numbers match on both ends.
+  const ids = {};
+  for (const c of trio) ids[c.name] = await c.call("identity");
+  const snAB = await A.call("safetyNumber", B.id);
+  const snBA = await B.call("safetyNumber", A.id);
+  const snAC = await A.call("safetyNumber", C.id);
+  let pinsOk = true;
+  const pinLines = [];
+  for (const rx of trio)
+    for (const tx of trio) {
+      if (rx === tx) continue;
+      const good = ids[rx.name].pins[tx.id] === ids[tx.name].fingerprint && /^sha-256 ([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(ids[tx.name].fingerprint);
+      if (!good) pinsOk = false;
+      pinLines.push(`${rx.name} pins ${tx.name}: ${good ? "matches" : "MISMATCH"} (${ids[rx.name].pins[tx.id]})`);
+    }
+  const snOk = !!snAB && snAB === snBA && /^\d{5}( \d{5}){4}$/.test(snAB) && snAC !== snAB;
+  record("identity 1: TOFU pins equal the peers' long-term certificates; safety numbers identical on both ends", m0.ok && pinsOk && snOk, [
+    ...fmtMesh(m0.status),
+    ...pinLines,
+    `safety alice<->bob: alice sees ${snAB}, bob sees ${snBA}; alice<->carol ${snAC}`,
+  ]);
+
+  // I2. MITM / mid-call key change: bob's connection to alice suddenly presents a
+  // different DTLS key (what a hub substituting its own relay certificate looks like).
+  const oldBobFp = ids.bob.fingerprint;
+  const newBobFp = await B.call("swapCertificate");
+  await B.call("forceReset", A.id);
+  let mismatch = null;
+  try {
+    await waitEvent(all, A, "identityMismatch", (e) => e.userId === B.id, 20_000, "alice identityMismatch for bob");
+    mismatch = lastEv(A, "identityMismatch", (e) => e.userId === B.id);
+  } catch {}
+  await sleep(6000); // give a would-be connection plenty of time
+  const blockedStatus = await meshStatus(trio);
+  const audioA = await A.call("sampleAudio", 2000);
+  await drainAll(all);
+  const aToB = blockedStatus.alice?.bob;
+  const bToA = blockedStatus.bob?.alice;
+  const aPeers = await A.peers();
+  const blockedFlag = aPeers.find((p) => p.userId === B.id)?.identityBlocked === true;
+  const fromBob = audioA[B.id];
+  const noMedia = !fromBob || fromBob.bytes === 0;
+  const acOk = blockedStatus.alice?.carol?.state === "connected" && blockedStatus.carol?.alice?.state === "connected";
+  const bcOk = blockedStatus.bob?.carol?.state === "connected";
+  const mismatchCount = A.events.filter((e) => e.type === "identityMismatch").length;
+  const ok2 =
+    !!mismatch &&
+    mismatch.expected === oldBobFp &&
+    mismatch.received === newBobFp &&
+    mismatch.reason === "changed" &&
+    aToB?.state !== "connected" &&
+    bToA?.state !== "connected" &&
+    blockedFlag &&
+    noMedia &&
+    acOk &&
+    bcOk;
+  record("identity 2: a substituted key mid-call is blocked (identityMismatch, no connection, no media); other legs unaffected", ok2, [
+    `mismatch event: ${mismatch ? JSON.stringify({ expected: mismatch.expected === oldBobFp ? "old bob fp" : mismatch.expected, received: mismatch.received === newBobFp ? "new bob fp" : mismatch.received, reason: mismatch.reason }) : "none"} (x${mismatchCount} after dedupe)`,
+    `alice->bob ${aToB?.state}, bob->alice ${bToA?.state}, alice peerInfo.identityBlocked=${blockedFlag}`,
+    `alice <- bob mic while blocked: ${fmtAudio(fromBob)}`,
+    ...fmtMesh(blockedStatus),
+    ...errorsOf(trio),
+  ]);
+
+  // I3. "Trust new key" -> re-pin + retryPeer: the call recovers.
+  const trusted = await A.call("trustPeer", B.id);
+  const m3 = await waitMesh(trio, 20_000);
+  const audio3 = await A.call("sampleAudio", 2000);
+  const audioB3 = await B.call("sampleAudio", 2000);
+  const snAB2 = await A.call("safetyNumber", B.id);
+  const snBA2 = await B.call("safetyNumber", A.id);
+  await drainAll(all);
+  const flows = !!audio3[B.id] && audio3[B.id].bytes > 0 && !!audioB3[A.id] && audioB3[A.id].bytes > 0;
+  const ok3 = trusted === newBobFp && m3.ok && flows && !!snAB2 && snAB2 === snBA2 && snAB2 !== snAB;
+  record("identity 3: after Trust new key the connection recovers, audio flows both ways, safety number changed and agrees", ok3, [
+    `re-pinned to new bob fp: ${trusted === newBobFp}; mesh connected after ${m3.connectedMs ?? "never"} ms`,
+    `alice <- bob: ${fmtAudio(audio3[B.id])}`,
+    `bob <- alice: ${fmtAudio(audioB3[A.id])}`,
+    `safety alice<->bob now ${snAB2} / ${snBA2} (was ${snAB})`,
+    ...fmtMesh(m3.status),
+    ...errorsOf(trio),
+    ...(m3.ok && !VERBOSE ? [] : await debugDump(trio, ["alice", "bob"])),
+  ]);
 }
 
 app.whenReady().then(async () => {

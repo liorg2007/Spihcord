@@ -25,7 +25,26 @@ export interface VoiceCallOptions {
   noiseSuppression?: boolean;
   echoCancellation?: boolean;
   autoGainControl?: boolean;
+  /**
+   * Long-term DTLS certificate (ECDSA P-256 recommended) used for every
+   * connection, so the local fingerprint is stable and can be pinned by peers.
+   * Omitted = a fresh certificate per connection (no pinning possible).
+   */
+  certificate?: RTCCertificate;
+  /**
+   * Identity check run before any remote offer/answer is applied. When set,
+   * the description must carry only sha-256 fingerprints that all agree, and
+   * the verdict decides whether it is applied. A distrusted description is not
+   * applied: the peer stays blocked (no media) and `identityMismatch` fires
+   * until `retryPeer` is called after the pin was updated.
+   */
+  verifyFingerprint?: FingerprintVerifier;
 }
+
+/** Canonical fingerprint: "sha-256 AB:CD:..." (upper-case hex). */
+export type FingerprintVerdict = { trusted: true } | { trusted: false; expected: string };
+/** Synchronous so it can run in order with the rest of the signaling (TOFU: pin when unknown, then trust). */
+export type FingerprintVerifier = (userId: string, fingerprint: string) => FingerprintVerdict;
 
 export type InputMode = "voice-activity" | "push-to-talk";
 
@@ -86,6 +105,10 @@ export interface PeerInfo {
   /** 0..2 playback volume set by the local user (1 = 100%). */
   volume: number;
   locallyMuted: boolean;
+  /** The remote DTLS fingerprint accepted for this connection (when pinning is on). */
+  fingerprint?: string;
+  /** True while the connection is blocked by an identity mismatch (no media). */
+  identityBlocked?: boolean;
 }
 
 export interface VoiceCallEvents {
@@ -120,6 +143,14 @@ export interface VoiceCallEvents {
   localCamera: { stream: MediaStream | null };
   /** Our local camera stopped on its own (device unplugged / permission revoked). */
   localCameraEnded: Record<string, never>;
+
+  /**
+   * A peer presented a DTLS identity that failed verification. Nothing from it
+   * is applied (no media) until `retryPeer(userId)`. reason "changed": the
+   * fingerprint differs from the pin (`expected`); "invalid": the SDP had no,
+   * non-sha-256 or disagreeing fingerprints (`received` holds the reason).
+   */
+  identityMismatch: { userId: string; expected: string; received: string; reason: "changed" | "invalid" };
 }
 
 export interface VoiceCall {
@@ -176,6 +207,18 @@ export interface VoiceCall {
   setCameraDevice(deviceId: string): Promise<void>;
   /** Tell a sender how much of their camera we want. Default "high". Remembered per user. */
   setCameraPreference(userId: string, preference: CameraPreference): void;
+
+  /**
+   * Safety number for the connection to `userId`: derived from both DTLS
+   * fingerprints, identical on both ends. null until a fingerprint was accepted.
+   */
+  getSafetyNumber(userId: string): Promise<string | null>;
+  /**
+   * Re-run identity verification for a blocked peer (after the app updated its
+   * pin, e.g. "Trust new key"). Recreates the connection and replays the
+   * blocked description; no-op if the peer is not blocked.
+   */
+  retryPeer(userId: string): void;
 
   on<K extends keyof VoiceCallEvents>(event: K, handler: (payload: VoiceCallEvents[K]) => void): () => void;
 

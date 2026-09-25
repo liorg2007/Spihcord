@@ -338,6 +338,18 @@ A layout friends already know from Discord:
 ## 8. Security and privacy
 
 - **Media:** WebRTC always encrypts with DTLS-SRTP. With direct P2P, the hub never sees audio or video. TURN relays only forward encrypted packets and can't decrypt them.
+- **Media identity (TOFU pinning + safety numbers; fixes audit M1/M2):** DTLS alone doesn't stop a malicious hub. The hub relays the SDP, so it could swap in its own `a=fingerprint` and sit in the middle.
+  - Each install keeps a long-term ECDSA P-256 `RTCCertificate` in IndexedDB. It expires after 1 year and is regenerated when fewer than 30 days remain. The engine passes it as `certificates:[cert]` for every connection and hands the same object to `setConfiguration`.
+  - Before any remote offer or answer is applied, the engine reads every `a=fingerprint` line. They must all be sha-256 and all agree. The `verifyFingerprint(userId, fp)` hook then checks the fingerprint against a TOFU pin keyed by server URL and userId.
+  - On a mismatch, nothing is applied (no DTLS, so no media). The engine emits `identityMismatch {userId, expected, received}`.
+  - The app then shows "X's security key changed — the connection may be intercepted. Compare safety numbers." with two choices:
+    - **Trust new key:** re-pins the key and calls `retryPeer`.
+    - **Disconnect:** leaves the call.
+  - A remote restart is detected by a new fingerprint or a new `o=` session id, and it goes through the same check. A mid-call key change is therefore never accepted silently.
+  - `getSafetyNumber(userId)` returns 5×5 digits from SHA-256 over the two sorted fingerprints, and both ends see the same value. The user popover shows it with "Mark as verified", which is persisted. Verified peers get a shield on their tile.
+  - Limits:
+    - The very first contact is trust-on-first-use.
+    - A reinstall or a cleared profile shows up as a key change.
 - **Optional true E2EE for calls** (Phase 5): insertable streams / SFrame with a key agreed per call. This matters only if the SFU fallback is used.
 - **Transport:** hub behind Caddy with automatic HTTPS; WSS only.
 - **Auth:** argon2id password hashes, short-lived JWT access token plus a refresh token stored with Electron `safeStorage` (OS keychain).

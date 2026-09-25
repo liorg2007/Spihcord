@@ -20,6 +20,8 @@ import type { HubClient } from "./hub";
 import { bridge } from "./bridge";
 import { setCameraPrefSender } from "./cameraPrefs";
 import { playSound, setSoundOutputDevice } from "./sounds";
+import { addMismatch, clearMismatches, dropMismatch, getCertificate, getPin, makeVerifier, repin, setSelfFingerprint } from "./identity";
+import { certificateFingerprint } from "@shpihcord/call-engine";
 
 let hub: HubClient | null = null;
 let call: VoiceCall | null = null;
@@ -160,6 +162,7 @@ function teardownCall(): void {
   signaling = null;
   lastSyncKey = "";
   setCameraPrefSender(null);
+  clearMismatches();
   // call.close() stopped our share, our camera and all received streams.
   shareSeq++;
   cameraSeq++;
@@ -216,6 +219,17 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
   const gen = ++generation;
   setApp({ voiceChannelId: channelId, voiceStatus: "connecting", peers: {}, speaking: {} });
 
+  const serverUrl = getApp().session?.serverUrl ?? "";
+  // Long-term DTLS certificate so peers can pin us (security M1/M2).
+  let certificate: RTCCertificate | undefined;
+  try {
+    certificate = await getCertificate();
+    setSelfFingerprint(certificateFingerprint(certificate) ?? null);
+  } catch (err) {
+    console.warn("[voice] no long-term certificate, peers can't pin this session", err);
+  }
+  if (gen !== generation) return;
+
   const s = getSettings();
   const sig = makeSignaling(h);
   let c: VoiceCall;
@@ -232,6 +246,8 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
       noiseSuppression: s.noiseSuppression,
       echoCancellation: s.echoCancellation,
       autoGainControl: s.autoGainControl,
+      certificate,
+      verifyFingerprint: makeVerifier(serverUrl),
     });
   } catch (err) {
     sig.dispose();
@@ -246,8 +262,15 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
       setApp((st) => ({ peers: { ...st.peers, [info.userId]: info } }));
       applyStoredPeerPrefs(info);
     }),
+    c.on("identityMismatch", ({ userId, expected, received, reason }) => {
+      if (gen !== generation) return;
+      console.warn(`[voice] identity of ${userId} changed (${reason}): pinned ${expected}, presented ${received}`);
+      addMismatch({ userId, expected, received, reason, wasVerified: !!getPin(serverUrl, userId)?.verified });
+      playSound("error");
+    }),
     c.on("peerRemoved", ({ userId }) => {
       if (gen !== generation) return;
+      dropMismatch(userId);
       setApp((st) => {
         const peers = { ...st.peers };
         delete peers[userId];
@@ -456,6 +479,21 @@ export function setPushToTalk(active: boolean): void {
 export function setPeerVolume(userId: string, volume: number): void {
   useSettings.getState().setUserVolume(userId, volume);
   call?.setPeerVolume(userId, volume);
+}
+
+/** Mismatch dialog: "Trust new key" -> re-pin and retry the blocked connection. */
+export function trustNewIdentity(userId: string, fingerprint: string): void {
+  const serverUrl = getApp().session?.serverUrl;
+  dropMismatch(userId);
+  if (!serverUrl) return;
+  repin(serverUrl, userId, fingerprint);
+  call?.retryPeer(userId);
+}
+
+/** Mismatch dialog: "Disconnect" -> leave the call (the blocked peer never got media). */
+export function disconnectOnIdentityMismatch(): void {
+  clearMismatches();
+  leaveVoice();
 }
 
 export function setPeerMuted(userId: string, muted: boolean): void {

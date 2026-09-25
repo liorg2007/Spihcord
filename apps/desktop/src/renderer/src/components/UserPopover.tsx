@@ -5,7 +5,8 @@ import { setPeerMuted, setPeerVolume, setVideoHidden } from "../lib/voice";
 import { displayNameOf, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { SpeakerIcon } from "./Icons";
+import { ShieldIcon, SpeakerIcon } from "./Icons";
+import { ensureSelfFingerprint, pinKey, safetyNumber, setVerified, useIdentity } from "../lib/identity";
 
 interface PopoverState {
   userId: string | null;
@@ -45,6 +46,21 @@ export function UserPopover() {
   const muted = useSettings((s) => (userId ? (s.userMuted[userId] ?? false) : false));
   const videoHidden = useSettings((s) => (userId ? !!s.hiddenVideos[userId] : false));
   const allVideoOff = useSettings((s) => s.disableIncomingVideo);
+  const serverUrl = useApp((s) => s.session?.serverUrl);
+  const pin = useIdentity((s) => (serverUrl && userId ? s.pins[pinKey(serverUrl, userId)] : undefined));
+  const selfFp = useIdentity((s) => s.selfFingerprint);
+  const [sn, setSn] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSn(null);
+    if (!pin) return;
+    ensureSelfFingerprint();
+    let live = true;
+    void safetyNumber(pin.fingerprint).then((v) => live && setSn(v));
+    return () => {
+      live = false;
+    };
+  }, [pin?.fingerprint, selfFp]);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -126,6 +142,25 @@ export function UserPopover() {
         <input type="checkbox" checked={videoHidden || allVideoOff} disabled={allVideoOff} onChange={(e) => setVideoHidden(userId, e.target.checked)} />
         <span className="checkbox" aria-hidden="true" />
       </label>
+      {pin && serverUrl && (
+        <div className="popover-section">
+          <div className="popover-label">
+            <ShieldIcon size={14} /> Safety Number
+            {pin.verified && <span className="popover-value" style={{ color: "var(--green)" }}>verified</span>}
+          </div>
+          <div style={{ fontFamily: "monospace", fontSize: 13, letterSpacing: 0.5, userSelect: "text" }} title="Compare with the number on their screen">
+            {sn ?? "…"}
+          </div>
+          <button
+            className="btn btn-secondary btn-small"
+            style={{ marginTop: 8 }}
+            onClick={() => setVerified(serverUrl, userId, !pin.verified)}
+            title={pin.verified ? undefined : "Only after comparing this number with them over another channel"}
+          >
+            {pin.verified ? "Clear verification" : "Mark as verified"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

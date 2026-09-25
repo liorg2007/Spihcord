@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { ChannelSidebar } from "./components/ChannelSidebar";
 import { FatalScreen } from "./components/FatalScreen";
 import { GoLiveModal } from "./components/GoLiveModal";
+import { IdentityDialog } from "./components/IdentityDialog";
 import { LogoMark } from "./components/Icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { MainArea } from "./components/MainArea";
@@ -86,6 +87,7 @@ function AppShell() {
       <UserPopover />
       {goLiveOpen && <GoLiveModal />}
       {settingsOpen && <SettingsModal />}
+      <IdentityDialog />
     </div>
   );
 }

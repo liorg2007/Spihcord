@@ -24,11 +24,12 @@ import type {
 import { SCREEN_SHARE_PRESETS } from "./presets";
 import { Emitter } from "./emitter";
 import { AudioEngine, type MicSettings } from "./audio";
-import { Peer, type ResetReason } from "./peer";
+import { Peer, type IdentityEvent, type ResetReason } from "./peer";
 import { SignalBuffer, diffPeers, isPolite } from "./mesh";
 import { parseStatsReport, parseVideoStats, type LossCounters, type VideoCounters } from "./stats";
 import { DEFAULT_VAD_THRESHOLD, VadGate, clamp01 } from "./vad";
 import { mungeLocalSdp, mungeOutgoingSdp } from "./sdp";
+import { certificateFingerprint, computeSafetyNumber, parseDtlsFingerprint } from "./identity";
 import { CpuWatch, ScreenShareIntents, isStreamSignal, screenEncoding, type StreamAction } from "./screenShare";
 import { codecName, h264Rank, mediaCapabilitiesContentType, orderCameraCodecs, orderVideoCodecs, SCREEN_CODEC_ORDER, type CodecLike } from "./codecs";
 import { updateSenderParams } from "./senderParams";
@@ -135,6 +136,10 @@ export class VoiceCallImpl implements VoiceCall {
   private readonly mic: MicSettings;
 
   private iceServers: IceServer[];
+  /** Long-term DTLS certificate; the same object must go to every setConfiguration. */
+  private certificate: RTCCertificate | undefined;
+  /** Last identity mismatch reported per user (dedupes repeated offers while blocked). */
+  private readonly identityAlerts = new Map<string, string>();
   private readonly forceRelay: boolean;
   private muted = false;
   private deafened = false;
@@ -172,6 +177,7 @@ export class VoiceCallImpl implements VoiceCall {
   constructor(private readonly options: VoiceCallOptions) {
     this.selfId = options.selfId;
     this.iceServers = options.iceServers;
+    this.certificate = options.certificate;
     this.forceRelay = !!options.forceRelay;
     this.mode = options.inputMode ?? "voice-activity";
     this.vad = new VadGate({ threshold: options.vadThreshold ?? DEFAULT_VAD_THRESHOLD });
@@ -288,6 +294,35 @@ export class VoiceCallImpl implements VoiceCall {
     if (this.closed) return;
     const config = this.rtcConfig();
     for (const e of this.peers.values()) e.peer.setConfiguration(config);
+  }
+
+  async getSafetyNumber(userId: string): Promise<string | null> {
+    const e = this.peers.get(userId);
+    const remote = e?.peer.remoteFingerprint;
+    if (!e || !remote) return null;
+    const local =
+      certificateFingerprint(this.certificate) ??
+      (() => {
+        const p = parseDtlsFingerprint(e.peer.pc.localDescription?.sdp);
+        return p.ok ? p.fingerprint : undefined;
+      })();
+    if (!local) return null;
+    return computeSafetyNumber(local, remote);
+  }
+
+  retryPeer(userId: string): void {
+    if (this.closed) return;
+    const e = this.peers.get(userId);
+    if (!e || !e.peer.isBlocked) return;
+    const blocked = e.peer.takeBlocked();
+    this.identityAlerts.delete(userId);
+    // A fresh connection: the held-back offer (and its candidates) is replayed and
+    // re-verified; for a held-back answer the new connection simply offers again.
+    const replay =
+      blocked && blocked.description.kind === "description" && blocked.description.description.type === "offer"
+        ? [blocked.description, ...blocked.candidates]
+        : [];
+    this.resetPeer(userId, "identity-retry", replay);
   }
 
   getPeers(): PeerInfo[] {
@@ -521,6 +556,7 @@ export class VoiceCallImpl implements VoiceCall {
       iceTransportPolicy: this.forceRelay ? "relay" : "all",
       bundlePolicy: "max-bundle",
       rtcpMuxPolicy: "require",
+      ...(this.certificate ? { certificates: [this.certificate] } : {}),
     };
   }
 
@@ -573,6 +609,14 @@ export class VoiceCallImpl implements VoiceCall {
         onReset: (reason, signals) => {
           if (isCurrent()) this.resetPeer(userId, reason, signals ?? []);
         },
+        ...(this.options.verifyFingerprint
+          ? {
+              verifyFingerprint: (fp: string) => this.options.verifyFingerprint!(userId, fp),
+              onIdentity: (ev: IdentityEvent) => {
+                if (isCurrent()) this.onPeerIdentity(userId, ev);
+              },
+            }
+          : {}),
       });
     } catch (err) {
       this.emitError(`Failed to create connection to ${userId}`, err);
@@ -617,7 +661,22 @@ export class VoiceCallImpl implements VoiceCall {
     return e;
   }
 
+  private onPeerIdentity(userId: string, ev: IdentityEvent): void {
+    if (ev.status === "trusted") {
+      this.identityAlerts.delete(userId);
+      this.updateInfo(userId, { fingerprint: ev.fingerprint, identityBlocked: false });
+      return;
+    }
+    this.updateInfo(userId, { identityBlocked: true, connectionState: this.peers.get(userId)?.peer.connectionState ?? "new" });
+    const key = `${ev.reason}|${ev.expected}|${ev.received}`;
+    if (this.identityAlerts.get(userId) === key) return;
+    this.identityAlerts.set(userId, key);
+    console.warn(`[call-engine] identity of ${userId} rejected (${ev.reason}): expected ${ev.expected || "-"}, got ${ev.received}`);
+    this.emitter.emit("identityMismatch", { userId, expected: ev.expected, received: ev.received, reason: ev.reason });
+  }
+
   private removePeer(userId: string): void {
+    this.identityAlerts.delete(userId);
     this.intents.peerLeft(userId);
     this.camPrefs.peerLeft(userId);
     if (!this.disposePeer(userId)) return;

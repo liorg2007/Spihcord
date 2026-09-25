@@ -24,6 +24,7 @@ import {
   MicOffIcon,
   ScreenShareIcon,
   ScreenShareOffIcon,
+  ShieldIcon,
   SpeakerIcon,
   StatsIcon,
   VideoIcon,
@@ -31,6 +32,7 @@ import {
 } from "./Icons";
 import { LiveBadge, LiveBar, StreamStage, StreamVideo, statLine } from "./Stream";
 import { popoverTriggerProps } from "./UserPopover";
+import { useVerified } from "../lib/identity";
 
 export function VoiceView({ channel }: { channel: Channel }) {
   const voiceStates = useApp((s) => s.voiceStates);
@@ -182,6 +184,8 @@ function ParticipantTile({ vs, compact }: { vs: VoiceState; compact?: boolean })
   const showStats = useSettings((s) => s.streamStatsOverlay);
   const isSelf = vs.userId === selfId;
   const name = displayNameOf(users, vs.userId);
+  const serverUrl = useApp((st) => st.session?.serverUrl);
+  const verified = useVerified(serverUrl, isSelf ? null : vs.userId);
   const muted = isSelf ? selfMuted : vs.muted;
   const deafened = isSelf ? selfDeaf : vs.deafened;
   const badge = isSelf ? null : peerBadge(peer);
@@ -240,6 +244,11 @@ function ParticipantTile({ vs, compact }: { vs: VoiceState; compact?: boolean })
           {isSelf && <span className="tile-you">you</span>}
         </span>
         <span className="tile-icons">
+          {verified && !peer?.identityBlocked && (
+            <span className="tile-chip" title="Security key verified" style={{ color: "var(--green)" }}>
+              <ShieldIcon size={14} />
+            </span>
+          )}
           {!isSelf && Math.abs(volume - 1) > 0.005 && !locallyMuted && <span className="tile-vol">{Math.round(volume * 100)}%</span>}
           {pausedByMe && (
             <span className="tile-chip video-paused" title="You aren't receiving this camera">
