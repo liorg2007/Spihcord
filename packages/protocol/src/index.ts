@@ -51,22 +51,26 @@ export type IceServer = z.infer<typeof IceServerSchema>;
  * Opaque WebRTC signaling payload, relayed verbatim by the hub.
  * Perfect-negotiation style: either a session description or an ICE candidate.
  */
+export const MAX_SDP_LENGTH = 32 * 1024;
+export const MAX_CANDIDATE_LENGTH = 1024;
+
 export const SignalDataSchema = z.union([
   z.object({
     kind: z.literal("description"),
     description: z.object({
       type: z.enum(["offer", "answer", "pranswer", "rollback"]),
-      sdp: z.string().optional(),
+      /** Bounded (security B3); real SDPs with audio+video+screen are a few KB. */
+      sdp: z.string().max(MAX_SDP_LENGTH).optional(),
     }),
   }),
   z.object({
     kind: z.literal("candidate"),
     candidate: z
       .object({
-        candidate: z.string(),
-        sdpMid: z.string().nullable().optional(),
+        candidate: z.string().max(MAX_CANDIDATE_LENGTH),
+        sdpMid: z.string().max(256).nullable().optional(),
         sdpMLineIndex: z.number().nullable().optional(),
-        usernameFragment: z.string().nullable().optional(),
+        usernameFragment: z.string().max(256).nullable().optional(),
       })
       .nullable(),
   }),
@@ -91,11 +95,19 @@ export type SignalData = z.infer<typeof SignalDataSchema>;
 // POST /api/login     LoginRequest    -> AuthResponse
 // GET  /api/health    -> { ok: true, protocolVersion }
 // POST /api/invites   (Authorization: Bearer <token>, admin only) -> { code }
+// POST /api/logout               (Bearer) -> OkResponse         revokes this token
+// POST /api/sessions/revoke-all  (Bearer) -> OkResponse         revokes every token of the account
+// POST /api/password  (Bearer) ChangePasswordRequest -> AuthResponse
+//                     revokes all OTHER sessions; returns the (still valid) caller token + user
+// Revoked tokens' live WebSockets are closed with code 4001.
 // Errors: HTTP 4xx with ErrorResponse body.
+
+export const MIN_PASSWORD_LENGTH = 8;
+export const MAX_PASSWORD_LENGTH = 128;
 
 export const RegisterRequestSchema = z.object({
   username: z.string().min(2).max(32).regex(/^[a-zA-Z0-9_.-]+$/),
-  password: z.string().min(6).max(128),
+  password: z.string().min(MIN_PASSWORD_LENGTH).max(MAX_PASSWORD_LENGTH),
   inviteCode: z.string().min(1),
 });
 export type RegisterRequest = z.infer<typeof RegisterRequestSchema>;
@@ -111,6 +123,16 @@ export const AuthResponseSchema = z.object({
   user: UserSchema,
 });
 export type AuthResponse = z.infer<typeof AuthResponseSchema>;
+
+export const ChangePasswordRequestSchema = z.object({
+  currentPassword: z.string().max(MAX_PASSWORD_LENGTH),
+  newPassword: z.string().min(MIN_PASSWORD_LENGTH).max(MAX_PASSWORD_LENGTH),
+});
+export type ChangePasswordRequest = z.infer<typeof ChangePasswordRequestSchema>;
+
+/** Body of POST /api/logout and /api/sessions/revoke-all. */
+export const OkResponseSchema = z.object({ ok: z.literal(true) });
+export type OkResponse = z.infer<typeof OkResponseSchema>;
 
 export const ErrorResponseSchema = z.object({
   error: z.string(), // machine code, e.g. "invalid_credentials"

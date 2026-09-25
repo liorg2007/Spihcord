@@ -61,6 +61,18 @@ ENV
 else
   say "Keeping existing .env"
 fi
+# The hub refuses to start with a placeholder / short TURN_SECRET: replace one in place.
+CUR_SECRET="$(sed -n 's/^TURN_SECRET=//p' .env | tail -1)"
+if [ "$CUR_SECRET" = "change-me" ] || [ "${#CUR_SECRET}" -lt 32 ]; then
+  NEW_SECRET="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  if grep -q '^TURN_SECRET=' .env; then
+    sed -i "s/^TURN_SECRET=.*/TURN_SECRET=$NEW_SECRET/" .env
+  else
+    echo "TURN_SECRET=$NEW_SECRET" >> .env
+  fi
+  chmod 600 .env
+  say "Replaced a weak TURN_SECRET in .env with a random one"
+fi
 
 # 4. Firewall (only if ufw is active)
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then

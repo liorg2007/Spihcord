@@ -1,20 +1,28 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
+  ChangePasswordRequestSchema,
   LoginRequestSchema,
   PROTOCOL_VERSION,
   RegisterRequestSchema,
   type AuthResponse,
   type ErrorResponse,
+  type OkResponse,
   type User,
 } from "@shpihcord/protocol";
-import { hashPassword, issueToken, userForToken, verifyDummy, verifyPassword } from "./auth.js";
-import { toUser, type Store } from "./db.js";
+import { hashPassword, hashToken, issueToken, userForToken, verifyDummy, verifyPassword } from "./auth.js";
+import { toUser, type Store, type UserRow } from "./db.js";
 
 export interface HttpDeps {
   store: Store;
   /** Called after a successful registration (gateway broadcasts `user.upsert`). */
   onUserRegistered: (user: User) => void;
+  /**
+   * Called after sessions were revoked so live WebSockets using them are closed (code 4001).
+   * `tokenHash`: only that session; `exceptTokenHash`: all of the user's sessions but that one;
+   * neither: all of the user's sessions.
+   */
+  onSessionsRevoked: (userId: string, opts: { tokenHash?: string; exceptTokenHash?: string }) => void;
 }
 
 function sendError(reply: FastifyReply, status: number, error: string, message: string) {
@@ -102,11 +110,62 @@ export function registerHttpRoutes(app: FastifyInstance, deps: HttpDeps): void {
     return reply.send(body);
   });
 
-  app.post("/api/invites", async (req, reply) => {
-    const header = req.headers.authorization ?? "";
-    const match = /^Bearer\s+(\S+)$/i.exec(header);
+  /** Resolves the bearer token; sends 401 and returns null if it is missing or invalid. */
+  const authed = (req: FastifyRequest, reply: FastifyReply): { user: UserRow; tokenHash: string } | null => {
+    const match = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "");
     const user = match ? userForToken(store, match[1]) : undefined;
-    if (!user) return sendError(reply, 401, "unauthorized", "Missing or invalid token.");
+    if (!match || !user) {
+      void sendError(reply, 401, "unauthorized", "Missing or invalid token.");
+      return null;
+    }
+    return { user, tokenHash: hashToken(match[1]) };
+  };
+  const ok: OkResponse = { ok: true };
+
+  app.post("/api/logout", async (req, reply) => {
+    const auth = authed(req, reply);
+    if (!auth) return reply;
+    store.deleteSession(auth.tokenHash);
+    deps.onSessionsRevoked(auth.user.id, { tokenHash: auth.tokenHash });
+    req.log.info({ userId: auth.user.id }, "session revoked (logout)");
+    return reply.send(ok);
+  });
+
+  app.post("/api/sessions/revoke-all", async (req, reply) => {
+    const auth = authed(req, reply);
+    if (!auth) return reply;
+    store.deleteSessionsForUser(auth.user.id);
+    deps.onSessionsRevoked(auth.user.id, {});
+    req.log.info({ userId: auth.user.id }, "all sessions revoked");
+    return reply.send(ok);
+  });
+
+  app.post("/api/password", async (req, reply) => {
+    if (!limit(req, reply)) return reply;
+    const auth = authed(req, reply);
+    if (!auth) return reply;
+    const parsed = ChangePasswordRequestSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return sendError(reply, 400, "invalid_request", parsed.error.issues[0]?.message ?? "Invalid request");
+    }
+    const { currentPassword, newPassword } = parsed.data;
+    if (!(await verifyPassword(auth.user.password_hash, currentPassword))) {
+      return sendError(reply, 403, "invalid_credentials", "The current password is wrong.");
+    }
+    // The caller's session stays valid (so its live connection is not dropped); every other
+    // session is revoked and disconnected.
+    store.changePassword(auth.user.id, await hashPassword(newPassword), auth.tokenHash);
+    deps.onSessionsRevoked(auth.user.id, { exceptTokenHash: auth.tokenHash });
+    req.log.info({ userId: auth.user.id }, "password changed, other sessions revoked");
+    const match = /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? "")!;
+    const body: AuthResponse = { token: match[1], user: toUser(auth.user) };
+    return reply.send(body);
+  });
+
+  app.post("/api/invites", async (req, reply) => {
+    const auth = authed(req, reply);
+    if (!auth) return reply;
+    const { user } = auth;
     if (!user.is_admin) return sendError(reply, 403, "forbidden", "Only admins can create invites.");
 
     const parsed = CreateInviteBodySchema.safeParse(req.body ?? {});

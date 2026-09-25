@@ -13,14 +13,19 @@ services:
     environment:
       PORT: "8420"
       DATA_DIR: /data
-      TRUST_PROXY: "true"
+      # One proxy hop (Caddy). Never "true": that lets clients spoof their IP.
+      TRUST_PROXY: "1"
       TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET in .env}
-      TURN_URLS: turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp
-      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-43200}
+      TURN_URLS: ${TURN_URLS:-turn:${DOMAIN}:3478?transport=udp,turn:${DOMAIN}:3478?transport=tcp}
+      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-14400}
+      WS_MAX_CONNECTIONS: ${WS_MAX_CONNECTIONS:-1000}
+      WS_MAX_CONNECTIONS_PER_IP: ${WS_MAX_CONNECTIONS_PER_IP:-20}
+      WS_MAX_PENDING: ${WS_MAX_PENDING:-100}
       STUN_URLS: ${STUN_URLS:-stun:${DOMAIN}:3478,stun:stun.l.google.com:19302}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - hub_data:/data
+    # Not published on the host: only Caddy (same compose network) reaches it.
     expose:
       - "8420"
 

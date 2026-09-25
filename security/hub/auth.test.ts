@@ -8,7 +8,8 @@ import path from "node:path";
 import { hash } from "@node-rs/argon2";
 import { hashToken, issueToken, SESSION_TTL_MS } from "../../apps/hub/src/auth.js";
 import { Store } from "../../apps/hub/src/db.js";
-import { post, register, startHub, type TestHub } from "../../apps/hub/test/helpers.js";
+import { loadConfig } from "../../apps/hub/src/config.js";
+import { connect, post, register, startHub, type TestHub } from "../../apps/hub/test/helpers.js";
 
 const hubs: TestHub[] = [];
 async function hub(overrides = {}) {
@@ -60,14 +61,28 @@ describe("token storage & entropy", () => {
     for (const tk of seen) expect(tk).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 
-  it("has NO revocation path: password change / logout / revoke-all are absent", () => {
-    // Documented gap: the Store exposes createSession/getUserBySessionHash/pruneSessions only.
+  it("FIXED A6: tokens are revocable (logout / revoke-all / password change) and live 30 days sliding", async () => {
     const store = new Store(fs.mkdtempSync(path.join(os.tmpdir(), "rev-")));
     const methods = Object.getOwnPropertyNames(Object.getPrototypeOf(store));
-    expect(methods).not.toContain("deleteSession");
-    expect(methods).not.toContain("deleteSessionsForUser");
-    expect(SESSION_TTL_MS).toBe(90 * 24 * 60 * 60 * 1000); // 90-day non-revocable tokens
+    expect(methods).toContain("deleteSession");
+    expect(methods).toContain("deleteSessionsForUser");
+    expect(SESSION_TTL_MS).toBe(30 * 24 * 60 * 60 * 1000);
     store.close();
+
+    const t = await hub();
+    const u = await register(t, "revoke_me");
+    const { client } = await connect(t, u.token);
+    expect((await post(t.base, "/api/logout", {}, u.token)).status).toBe(200);
+    expect((await client.closed).code).toBe(4001); // live socket killed immediately
+    expect((await post(t.base, "/api/invites", {}, u.token)).status).toBe(401); // token dead
+
+    const stolen = (await post(t.base, "/api/login", { username: "revoke_me", password: "hunter22" })).body.token;
+    const mine = (await post(t.base, "/api/login", { username: "revoke_me", password: "hunter22" })).body.token;
+    const pw = await post(t.base, "/api/password", { currentPassword: "hunter22", newPassword: "new-password-1" }, mine);
+    expect(pw.status).toBe(200);
+    expect((await post(t.base, "/api/logout", {}, stolen)).status).toBe(401); // other sessions revoked
+    expect((await post(t.base, "/api/sessions/revoke-all", {}, pw.body.token)).status).toBe(200);
+    expect((await post(t.base, "/api/logout", {}, pw.body.token)).status).toBe(401);
   });
 });
 
@@ -114,18 +129,23 @@ describe("HTTP rate limiting & X-Forwarded-For", () => {
     expect(limited).toBe(true);
   });
 
-  it("with trustProxy ON, a rotating X-Forwarded-For bypasses the per-IP limiter", async () => {
-    const t = await hub({ trustProxy: true });
+  it("FIXED A11: TRUST_PROXY=true is refused", () => {
+    expect(() => loadConfig({ TRUST_PROXY: "true" })).toThrow(/not allowed/);
+  });
+
+  it("FIXED A11: behind one trusted hop, a rotating X-Forwarded-For no longer bypasses the limiter", async () => {
+    const t = await hub({ trustProxy: 1 });
     let sawLimit = false;
     for (let i = 0; i < 60; i++) {
       const res = await fetch(t.base + "/api/login", {
         method: "POST",
-        headers: { "content-type": "application/json", "x-forwarded-for": `10.0.0.${i}` },
+        // Attacker-chosen leftmost value; the proxy-appended rightmost is the real client.
+        headers: { "content-type": "application/json", "x-forwarded-for": `10.0.0.${i}, 198.51.100.20` },
         body: JSON.stringify({ username: "x", password: "y" }),
       });
       if (res.status === 429) sawLimit = true;
     }
-    expect(sawLimit).toBe(false); // 60 attempts, never limited -> bypass confirmed
+    expect(sawLimit).toBe(true);
   });
 });
 
@@ -168,9 +188,11 @@ describe("SQL injection (prepared statements)", () => {
 });
 
 describe("password policy", () => {
-  it("accepts a 6-char password with no complexity requirement", async () => {
+  it("FIXED A2: rejects passwords under 8 characters", async () => {
     const t = await hub();
     const res = await post(t.base, "/api/register", { username: "weakpw", password: "aaaaaa", inviteCode: t.invite });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(400);
+    const ok = await post(t.base, "/api/register", { username: "okpw", password: "aaaaaaaa", inviteCode: t.invite });
+    expect(ok.status).toBe(201);
   });
 });

@@ -2,8 +2,15 @@ import { createHash, randomBytes } from "node:crypto";
 import { hash, verify } from "@node-rs/argon2";
 import type { Store, UserRow } from "./db.js";
 
-/** Sessions live 90 days; refresh tokens / rotation can come later. */
-export const SESSION_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+/**
+ * Sessions expire after 30 days of NOT being used (security H1). Every use (HTTP or WS auth)
+ * slides the expiry forward, at most once per SESSION_SLIDE_GRANULARITY_MS to avoid a DB write
+ * per request. A desktop app that is opened at least monthly never asks to log in again, while a
+ * leaked token from an abandoned device dies within a month; explicit logout, revoke-all and
+ * password change cover the "leaked and still in use" case immediately.
+ */
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const SESSION_SLIDE_GRANULARITY_MS = 60 * 60 * 1000;
 
 /** @node-rs/argon2 defaults to argon2id (m=19456 KiB, t=2, p=1). */
 export function hashPassword(password: string): Promise<string> {
@@ -36,7 +43,15 @@ export function issueToken(store: Store, userId: string): string {
   return token;
 }
 
+/** Resolves a raw token to its user and slides the session's expiry. */
 export function userForToken(store: Store, token: string): UserRow | undefined {
   if (!token || token.length > 256) return undefined;
-  return store.getUserBySessionHash(hashToken(token));
+  const tokenHash = hashToken(token);
+  const session = store.getSession(tokenHash);
+  if (!session) return undefined;
+  const now = Date.now();
+  if (session.expires_at - now < SESSION_TTL_MS - SESSION_SLIDE_GRANULARITY_MS) {
+    store.touchSession(tokenHash, now + SESSION_TTL_MS);
+  }
+  return store.getUserById(session.user_id);
 }

@@ -3,7 +3,7 @@
 # (docker compose in this folder already sets context: ..)
 
 FROM node:22-slim AS deps
-# Toolchain in case better-sqlite3 / argon2 have no prebuilt binary for this platform.
+# Toolchain: better-sqlite3 is compiled from source (no unhashed prebuilt download, security S2).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
  && rm -rf /var/lib/apt/lists/*
@@ -19,14 +19,17 @@ COPY packages/protocol/package.json packages/protocol/
 COPY packages/call-engine/package.json packages/call-engine/
 COPY apps/hub/package.json apps/hub/
 COPY apps/desktop/package.json apps/desktop/
-RUN npm ci --workspace @shpihcord/hub --include-workspace-root
+# No install scripts run; the one native addon that needs building is rebuilt from source.
+# (@node-rs/argon2 ships per-platform packages pinned by integrity in the lockfile.)
+RUN npm ci --workspace @shpihcord/hub --include-workspace-root --ignore-scripts \
+ && npm rebuild better-sqlite3 --build-from-source
 
 FROM node:22-slim
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8420 \
     DATA_DIR=/data \
-    TRUST_PROXY=true \
+    TRUST_PROXY=1 \
     npm_config_update_notifier=false
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules

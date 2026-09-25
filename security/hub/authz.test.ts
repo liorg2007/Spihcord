@@ -92,7 +92,7 @@ describe("input validation / strictness", () => {
     B.client.close();
   });
 
-  it("accepts an arbitrarily huge SDP string up to the frame cap (no per-field length limit)", async () => {
+  it("FIXED B3: drops an oversized SDP (per-field .max()) instead of relaying it", async () => {
     const a = await register(t, "val_c");
     const b = await register(t, "val_d");
     const A = await joinVoice(t, a.token, 0);
@@ -103,8 +103,8 @@ describe("input validation / strictness", () => {
       to: b.user.id,
       data: { kind: "description", description: { type: "offer", sdp: bigSdp } },
     });
-    const got = await B.client.next("rtc.signal", () => true, 4000);
-    expect((got.data as any).description.sdp.length).toBe(bigSdp.length);
+    expect((await A.client.next("error")).code).toBe("invalid_message");
+    expect(await B.client.none("rtc.signal", 500)).toBe(true);
     A.client.close();
     B.client.close();
   });
@@ -177,23 +177,34 @@ describe("pre-auth DoS surface", () => {
     }
   });
 
-  it("has NO connection cap: 60 unauthenticated sockets all stay open", async () => {
+  it("FIXED B9: caps unauthenticated sockets per IP (default 20): of 60, the rest are refused", async () => {
     const socks: WebSocket[] = [];
     try {
-      await Promise.all(
+      const results = await Promise.all(
         Array.from({ length: 60 }, () => {
           const ws = new WebSocket(t.wsUrl);
           socks.push(ws);
-          return new Promise<void>((res, rej) => {
-            ws.once("open", () => res());
-            ws.once("error", rej);
+          return new Promise<number | "open">((res) => {
+            ws.once("open", () => res("open"));
+            ws.once("unexpected-response", (_req, r) => res(r.statusCode ?? 0));
+            ws.once("error", () => res(0));
           });
         }),
       );
-      const open = socks.filter((s) => s.readyState === WebSocket.OPEN).length;
-      expect(open).toBe(60); // demonstrates the missing cap
+      expect(results.filter((r) => r === "open").length).toBe(20);
+      expect(results.filter((r) => r === 429).length).toBe(40);
     } finally {
-      for (const s of socks) s.close();
+      await Promise.all(
+        socks.map((s) =>
+          s.readyState === WebSocket.OPEN
+            ? new Promise<void>((res) => {
+                s.once("close", () => res());
+                s.close();
+              })
+            : Promise.resolve(),
+        ),
+      );
+      await new Promise((r) => setTimeout(r, 100)); // let the hub release the slots
     }
   });
 
@@ -209,16 +220,27 @@ describe("pre-auth DoS surface", () => {
 });
 
 describe("session replacement abuse", () => {
-  it("lets a stolen token repeatedly kick the legitimate connection", async () => {
+  it("FIXED A7: a stolen token can only kick the user a few times, and the victim is told where from", async () => {
     const a = await register(t, "steal_victim");
-    const first = await connect(t, a.token);
-    // Attacker with the same token connects; server keeps newest, kicks the old.
-    const attacker = await connect(t, a.token);
-    const err = await first.client.next("error");
-    expect(err.code).toBe("session_replaced");
-    const { code } = await first.client.closed;
-    expect(code).toBe(4003);
-    attacker.client.close();
+    let current = await connect(t, a.token);
+    // Default: 5 replacements per 10 minutes per user.
+    for (let i = 0; i < 5; i++) {
+      const next = await connect(t, a.token);
+      const err = await current.client.next("error");
+      expect(err.code).toBe("session_replaced");
+      expect(err.message).toMatch(/IP 127\.0\.0\.1/);
+      expect((await current.client.closed).code).toBe(4003);
+      current = next;
+    }
+    const attacker = new TestClient(t.wsUrl);
+    await attacker.opened;
+    attacker.send({ type: "auth", token: a.token, protocolVersion: PROTOCOL_VERSION });
+    expect((await attacker.next("error")).code).toBe("session_replace_limited");
+    expect((await attacker.closed).code).toBe(4008);
+    expect(await current.client.none("error")).toBe(true); // victim stays connected
+    // The real fix for a stolen token is revocation: revoke-all kills it everywhere.
+    expect((await post(t.base, "/api/sessions/revoke-all", {}, a.token)).status).toBe(200);
+    expect((await current.client.closed).code).toBe(4001);
   });
 });
 
@@ -235,7 +257,8 @@ describe("rate limiting (per-connection token bucket)", () => {
 });
 
 describe("broadcast amplification (voice.update spam)", () => {
-  it("one voice.update produces a broadcast to every online user (O(N))", async () => {
+  // Kept by design: the sidebar shows who is in every voice channel, so voice.* goes to everyone.
+  it("one voice.update produces a broadcast to every online user (O(N), by design)", async () => {
     const sender = await register(t, "amp_sender");
     const S = await joinVoice(t, sender.token, 0);
     // Two bystanders NOT in voice: they still receive every voice.state broadcast.

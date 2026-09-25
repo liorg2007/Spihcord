@@ -11,10 +11,11 @@ import {
   type User,
   type VoiceState,
 } from "@shpihcord/protocol";
-import { userForToken } from "./auth.js";
+import { hashToken, userForToken } from "./auth.js";
 import type { HubConfig } from "./config.js";
 import { toUser, type Store } from "./db.js";
 import { iceServersFor, turnEnabled } from "./turn.js";
+import { clientIp, trustFunction } from "./net.js";
 
 /** Application close codes (4000-4999). */
 export const CloseCode = {
@@ -35,7 +36,10 @@ const MAX_RATE_VIOLATIONS = 500;
 
 interface Conn {
   ws: WebSocket;
+  ip: string;
   user: User | null;
+  /** sha256 of the token this connection authenticated with (to close it on revocation). */
+  tokenHash: string | null;
   lastPong: number;
   tokens: number;
   lastRefill: number;
@@ -54,6 +58,12 @@ export class Gateway {
   private readonly pending = new Set<Conn>();
   private readonly voice = new Map<string, VoiceState>();
   private readonly heartbeat: NodeJS.Timeout;
+  /** Open sockets (upgraded or upgrading) per client IP, and in total (security H4). */
+  private readonly perIp = new Map<string, number>();
+  private sockets = 0;
+  /** Recent session replacements per user id (security H2). */
+  private readonly replacements = new Map<string, number[]>();
+  private readonly trust: (addr: string, hop: number) => boolean;
 
   constructor(
     private readonly config: HubConfig,
@@ -61,7 +71,8 @@ export class Gateway {
     private readonly log: FastifyBaseLogger,
   ) {
     this.wss = new WebSocketServer({ noServer: true, maxPayload: config.wsMaxPayload });
-    this.wss.on("connection", (ws) => this.onConnection(ws));
+    this.trust = trustFunction(config.trustProxy);
+    this.wss.on("connection", (ws: WebSocket, _req: IncomingMessage, ip: string) => this.onConnection(ws, ip));
     this.heartbeat = setInterval(() => this.tick(), config.heartbeatIntervalMs);
   }
 
@@ -73,7 +84,45 @@ export class Gateway {
       socket.destroy();
       return;
     }
-    this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit("connection", ws, req));
+    const ip = clientIp(req, this.trust);
+    const reject = (status: string, why: string) => {
+      this.log.warn({ ip, why }, "ws connection refused");
+      socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      socket.destroy();
+    };
+    if (this.sockets >= this.config.wsMaxConnections) return reject("503 Service Unavailable", "global cap");
+    if (this.pending.size >= this.config.wsMaxPending) return reject("503 Service Unavailable", "pending cap");
+    if ((this.perIp.get(ip) ?? 0) >= this.config.wsMaxConnectionsPerIp) {
+      return reject("429 Too Many Requests", "per-ip cap");
+    }
+    // Count the socket until it is gone, whatever happens to the handshake.
+    this.sockets++;
+    this.perIp.set(ip, (this.perIp.get(ip) ?? 0) + 1);
+    socket.once("close", () => {
+      this.sockets--;
+      const n = (this.perIp.get(ip) ?? 1) - 1;
+      if (n <= 0) this.perIp.delete(ip);
+      else this.perIp.set(ip, n);
+    });
+    this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit("connection", ws, req, ip));
+  }
+
+  /** Current socket counts (for tests / diagnostics). */
+  stats(): { sockets: number; pending: number; online: number } {
+    return { sockets: this.sockets, pending: this.pending.size, online: this.online.size };
+  }
+
+  /**
+   * Closes live connections using revoked tokens (security H1), with close code 4001.
+   * `tokenHash` given: only that token's connection; else every connection of the user
+   * except the one using `exceptTokenHash`.
+   */
+  revokeSessions(userId: string, opts: { tokenHash?: string; exceptTokenHash?: string } = {}): void {
+    const conn = this.online.get(userId);
+    if (!conn || !conn.tokenHash) return;
+    if (opts.tokenHash !== undefined && conn.tokenHash !== opts.tokenHash) return;
+    if (opts.exceptTokenHash !== undefined && conn.tokenHash === opts.exceptTokenHash) return;
+    this.fail(conn, "session_revoked", "This session was signed out.", CloseCode.unauthorized);
   }
 
   /** Broadcast a newly registered user to everyone online. */
@@ -96,11 +145,13 @@ export class Gateway {
 
   // ---------------------------------------------------------------------------
 
-  private onConnection(ws: WebSocket): void {
+  private onConnection(ws: WebSocket, ip: string): void {
     const now = Date.now();
     const conn: Conn = {
       ws,
+      ip,
       user: null,
+      tokenHash: null,
       lastPong: now,
       tokens: BUCKET_CAPACITY,
       lastRefill: now,
@@ -185,13 +236,25 @@ export class Gateway {
       return;
     }
     const user = toUser(row);
+    const previous = this.online.get(user.id);
+    if (previous && !this.allowReplacement(user.id)) {
+      this.log.warn({ userId: user.id, ip: conn.ip }, "session replacement rate limited");
+      this.fail(
+        conn,
+        "session_replace_limited",
+        "This account is switching devices too often; try again in a few minutes. " +
+          "If that wasn't you, change your password (it signs out other devices).",
+        CloseCode.rateLimited,
+      );
+      return;
+    }
     this.pending.delete(conn);
     if (conn.authTimer) clearTimeout(conn.authTimer);
     conn.authTimer = null;
     conn.user = user;
+    conn.tokenHash = hashToken(msg.token);
     conn.lastPong = Date.now();
 
-    const previous = this.online.get(user.id);
     if (previous) {
       // One connection per user: the newest wins.
       previous.replaced = true;
@@ -200,7 +263,9 @@ export class Gateway {
       this.send(previous, {
         type: "error",
         code: "session_replaced",
-        message: "You connected from somewhere else.",
+        message:
+          `Your account connected from another device (IP ${conn.ip}) at ${new Date().toISOString()}. ` +
+          "If that wasn't you, change your password or sign out all devices.",
       });
       previous.ws.close(CloseCode.sessionReplaced, "session replaced");
     }
@@ -219,6 +284,19 @@ export class Gateway {
 
     if (!previous) this.broadcast({ type: "presence.update", userId: user.id, online: true }, user.id);
     this.log.info({ userId: user.id, username: user.username, replaced: !!previous }, "ws authenticated");
+  }
+
+  /** Sliding-window limit on how often a user's live session can be taken over. */
+  private allowReplacement(userId: string): boolean {
+    const now = Date.now();
+    const recent = (this.replacements.get(userId) ?? []).filter((t) => now - t < this.config.sessionReplaceWindowMs);
+    if (recent.length >= this.config.sessionReplaceMax) {
+      this.replacements.set(userId, recent);
+      return false;
+    }
+    recent.push(now);
+    this.replacements.set(userId, recent);
+    return true;
   }
 
   private onClose(conn: Conn): void {

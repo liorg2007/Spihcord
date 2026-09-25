@@ -1,11 +1,24 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		-Server
+	}
+
+	# The hub runs with TRUST_PROXY=1 (exactly one proxy hop: this Caddy). Overwrite
+	# X-Forwarded-For with the real peer address so clients cannot inject their own
+	# (the hub rate-limits and caps connections by this IP).
 	handle /api/* {
-		reverse_proxy hub:8420
+		reverse_proxy hub:8420 {
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 	handle /ws {
-		reverse_proxy hub:8420
+		reverse_proxy hub:8420 {
+			header_up X-Forwarded-For {remote_host}
+		}
 	}
 	handle {
 		respond "Shpihcord hub" 200

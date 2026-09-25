@@ -74,12 +74,32 @@ export function toUser(row: UserRow): User {
   return { id: row.id, username: row.username, displayName: row.display_name };
 }
 
+function restrictMode(p: string, mode: number): void {
+  try {
+    if (fs.existsSync(p)) fs.chmodSync(p, mode);
+  } catch {
+    /* e.g. a volume owned by someone else; not fatal */
+  }
+}
+
+export interface SessionRow {
+  token_hash: string;
+  user_id: string;
+  created_at: number;
+  expires_at: number;
+}
+
 export class Store {
   readonly db: DB;
 
   constructor(dataDir: string) {
-    fs.mkdirSync(dataDir, { recursive: true });
-    this.db = new Database(path.join(dataDir, "hub.sqlite"));
+    // Owner-only data dir and DB file (security A14). SQLite gives -wal/-shm the DB file's mode.
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    restrictMode(dataDir, 0o700);
+    const file = path.join(dataDir, "hub.sqlite");
+    fs.closeSync(fs.openSync(file, "a", 0o600));
+    for (const f of [file, `${file}-wal`, `${file}-shm`]) restrictMode(f, 0o600);
+    this.db = new Database(file);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.pragma("busy_timeout = 5000");
@@ -179,6 +199,36 @@ export class Store {
          WHERE s.token_hash = ? AND s.expires_at > ?`,
       )
       .get(tokenHash, Date.now()) as UserRow | undefined;
+  }
+
+  /** A live (unexpired) session. */
+  getSession(tokenHash: string): SessionRow | undefined {
+    return this.db
+      .prepare("SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?")
+      .get(tokenHash, Date.now()) as SessionRow | undefined;
+  }
+
+  touchSession(tokenHash: string, expiresAt: number): void {
+    this.db.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ?").run(expiresAt, tokenHash);
+  }
+
+  deleteSession(tokenHash: string): void {
+    this.db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash);
+  }
+
+  /** Deletes every session of the user, except `keepTokenHash` if given. */
+  deleteSessionsForUser(userId: string, keepTokenHash?: string): void {
+    this.db
+      .prepare("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?")
+      .run(userId, keepTokenHash ?? "");
+  }
+
+  /** Sets a new password hash and revokes every other session, atomically. */
+  changePassword(userId: string, passwordHash: string, keepTokenHash: string): void {
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE users SET password_hash = ? WHERE id = ?").run(passwordHash, userId);
+      this.deleteSessionsForUser(userId, keepTokenHash);
+    })();
   }
 
   pruneSessions(): void {

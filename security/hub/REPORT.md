@@ -2,6 +2,14 @@
 
 Scope: `apps/hub` (Fastify + `ws` + better-sqlite3 + `@node-rs/argon2`), `packages/protocol`, plus a read-only review of the desktop session store. Areas: (A) authentication, sessions and secrets at rest; (B) authorization, input validation and DoS. Static review + a runnable attack suite (`security/hub/`, vitest, starts a real hub on 127.0.0.1:0). No source files modified.
 
+## Fix status (security-fixes branch)
+The FAIL/RISK tests now assert the fixes (29/29 pass):
+- A6/A7: `POST /api/logout`, `/api/sessions/revoke-all`, `/api/password` (revokes other sessions); revoked tokens' live WS closed with 4001; TTL 30 days sliding. Session replacement limited to 5 per 10 min per user, and `session_replaced` names the new IP and time.
+- A11: `TRUST_PROXY` is a hop count or IP/CIDR list (`true` refused); Caddy overwrites X-Forwarded-For.
+- B9: WS caps: global (`WS_MAX_CONNECTIONS`, 1000), per IP (`WS_MAX_CONNECTIONS_PER_IP`, 20) and unauthenticated (`WS_MAX_PENDING`, 100).
+- B3: `sdp` max 32 KiB, `candidate` max 1 KiB. A2: password min 8. A14: data dir 0700, DB 0600.
+- B13: unchanged by design (the sidebar needs voice state for all channels).
+
 ## Running the attack tests
 ```
 security\hub\run.bat
