@@ -31,8 +31,14 @@ export interface Settings {
   screenAppAudioOnly: boolean;
   /** Per-sharer stream audio volume 0..2 (1 = 100%). */
   streamVolumes: Record<string, number>;
-  /** Show the stats overlay on watched streams. */
+  /** Show the stats overlay on watched streams (and camera tiles). */
   streamStatsOverlay: boolean;
+  /** Camera device ("default" = system default). The camera itself is never persisted as on. */
+  videoDeviceId: string;
+  /** Per-user local "Hide video" (stops receiving that camera). */
+  hiddenVideos: Record<string, boolean>;
+  /** "Don't receive video": pause every camera. */
+  disableIncomingVideo: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -56,6 +62,9 @@ export const DEFAULT_SETTINGS: Settings = {
   screenAppAudioOnly: false,
   streamVolumes: {},
   streamStatsOverlay: false,
+  videoDeviceId: "default",
+  hiddenVideos: {},
+  disableIncomingVideo: false,
 };
 
 const KEY = "shpihcord.settings.v1";
@@ -73,6 +82,8 @@ function load(): Settings {
     if (!merged.userVolumes || typeof merged.userVolumes !== "object") merged.userVolumes = {};
     if (!merged.userMuted || typeof merged.userMuted !== "object") merged.userMuted = {};
     if (!merged.streamVolumes || typeof merged.streamVolumes !== "object") merged.streamVolumes = {};
+    if (!merged.hiddenVideos || typeof merged.hiddenVideos !== "object") merged.hiddenVideos = {};
+    if (typeof merged.videoDeviceId !== "string" || !merged.videoDeviceId) merged.videoDeviceId = "default";
     if (!["text", "balanced", "gaming", "source"].includes(merged.screenPreset)) merged.screenPreset = DEFAULT_SETTINGS.screenPreset;
     return merged;
   } catch {
@@ -93,6 +104,7 @@ interface SettingsStore extends Settings {
   setUserVolume(userId: string, volume: number): void;
   setUserMuted(userId: string, muted: boolean): void;
   setStreamVolume(userId: string, volume: number): void;
+  setVideoHidden(userId: string, hidden: boolean): void;
 }
 
 export const useSettings = create<SettingsStore>()((set, get) => ({
@@ -103,13 +115,19 @@ export const useSettings = create<SettingsStore>()((set, get) => ({
   setUserMuted: (userId, muted) => set({ userMuted: { ...get().userMuted, [userId]: muted } }),
   setStreamVolume: (userId, volume) =>
     set({ streamVolumes: { ...get().streamVolumes, [userId]: Math.min(2, Math.max(0, volume)) } }),
+  setVideoHidden: (userId, hidden) => {
+    const hiddenVideos = { ...get().hiddenVideos };
+    if (hidden) hiddenVideos[userId] = true;
+    else delete hiddenVideos[userId];
+    set({ hiddenVideos });
+  },
 }));
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 useSettings.subscribe((state) => {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const { update: _u, setUserVolume: _v, setUserMuted: _m, setStreamVolume: _s, ...data } = state;
+    const { update: _u, setUserVolume: _v, setUserMuted: _m, setStreamVolume: _s, setVideoHidden: _h, ...data } = state;
     save(data);
   }, 150);
 });

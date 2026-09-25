@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { create } from "zustand";
 import { peerBadge } from "../lib/format";
-import { setPeerMuted, setPeerVolume } from "../lib/voice";
+import { setPeerMuted, setPeerVolume, setVideoHidden } from "../lib/voice";
 import { displayNameOf, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
@@ -43,6 +43,8 @@ export function UserPopover() {
   const inMyCall = useApp((s) => !!userId && !!s.voiceChannelId && s.voiceStates[userId]?.channelId === s.voiceChannelId);
   const volume = useSettings((s) => (userId ? (s.userVolumes[userId] ?? 1) : 1));
   const muted = useSettings((s) => (userId ? (s.userMuted[userId] ?? false) : false));
+  const videoHidden = useSettings((s) => (userId ? !!s.hiddenVideos[userId] : false));
+  const allVideoOff = useSettings((s) => s.disableIncomingVideo);
 
   useLayoutEffect(() => {
     const el = ref.current;
@@ -117,6 +119,11 @@ export function UserPopover() {
       <label className="menu-check">
         <span>Mute</span>
         <input type="checkbox" checked={muted} onChange={(e) => setPeerMuted(userId, e.target.checked)} />
+        <span className="checkbox" aria-hidden="true" />
+      </label>
+      <label className="menu-check menu-check-tight" title={allVideoOff ? "All incoming video is off in Settings" : undefined}>
+        <span>Hide Video</span>
+        <input type="checkbox" checked={videoHidden || allVideoOff} disabled={allVideoOff} onChange={(e) => setVideoHidden(userId, e.target.checked)} />
         <span className="checkbox" aria-hidden="true" />
       </label>
     </div>

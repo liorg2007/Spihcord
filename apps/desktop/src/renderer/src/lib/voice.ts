@@ -18,6 +18,7 @@ import { getApp, setApp, toast, type AppState } from "../store/app";
 import { getSettings, useSettings, type Settings } from "../store/settings";
 import type { HubClient } from "./hub";
 import { bridge } from "./bridge";
+import { setCameraPrefSender } from "./cameraPrefs";
 import { playSound, setSoundOutputDevice } from "./sounds";
 
 let hub: HubClient | null = null;
@@ -31,6 +32,8 @@ let awaitingSelfState = false;
 let lastSyncKey = "";
 /** Bumped on every Go Live attempt / stop; a stale getDisplayMedia result is discarded. */
 let shareSeq = 0;
+/** Bumped on every camera start / stop; a stale startCamera result is discarded. */
+let cameraSeq = 0;
 const levelListeners = new Set<(level: number) => void>();
 
 // ---------------------------------------------------------------------------
@@ -156,9 +159,20 @@ function teardownCall(): void {
   signaling?.dispose();
   signaling = null;
   lastSyncKey = "";
-  // call.close() stopped our share and all received streams.
+  setCameraPrefSender(null);
+  // call.close() stopped our share, our camera and all received streams.
   shareSeq++;
-  setApp({ localShare: null, focusedStream: null, remoteStreams: {}, streamStats: {}, goLiveOpen: false });
+  cameraSeq++;
+  setApp({
+    localShare: null,
+    focusedStream: null,
+    remoteStreams: {},
+    streamStats: {},
+    goLiveOpen: false,
+    cameraStatus: "off",
+    localCamera: null,
+    remoteCameras: {},
+  });
 }
 
 function describeMediaError(err: unknown): string {
@@ -237,7 +251,19 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
         delete peers[userId];
         const speaking = { ...st.speaking };
         delete speaking[userId];
-        return { peers, speaking };
+        const patch: Partial<AppState> = { peers, speaking };
+        if (st.remoteCameras[userId]) {
+          const remoteCameras = { ...st.remoteCameras };
+          delete remoteCameras[userId];
+          patch.remoteCameras = remoteCameras;
+        }
+        const camKeys = [`cam:send:${userId}`, `cam:recv:${userId}`].filter((k) => st.streamStats[k]);
+        if (camKeys.length) {
+          const streamStats = { ...st.streamStats };
+          for (const k of camKeys) delete streamStats[k];
+          patch.streamStats = streamStats;
+        }
+        return patch;
       });
     }),
     c.on("speaking", ({ userId, speaking }) => {
@@ -284,6 +310,30 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
       const key = statsKey(stats);
       setApp((st) => ({ streamStats: { ...st.streamStats, [key]: stats } }));
     }),
+    c.on("remoteCamera", ({ userId, stream }) => {
+      if (gen !== generation) return;
+      setApp((st) => {
+        if (stream ? st.remoteCameras[userId] === stream : !st.remoteCameras[userId]) return {};
+        const remoteCameras = { ...st.remoteCameras };
+        if (stream) remoteCameras[userId] = stream;
+        else delete remoteCameras[userId];
+        const patch: Partial<AppState> = { remoteCameras };
+        if (!stream && st.streamStats[`cam:recv:${userId}`]) {
+          const streamStats = { ...st.streamStats };
+          delete streamStats[`cam:recv:${userId}`];
+          patch.streamStats = streamStats;
+        }
+        return patch;
+      });
+    }),
+    c.on("localCamera", ({ stream }) => {
+      if (gen !== generation) return;
+      setApp({ localCamera: stream });
+    }),
+    c.on("localCameraEnded", () => {
+      if (gen !== generation) return;
+      stopCamera("ended");
+    }),
     c.on("error", ({ message, cause }) => {
       if (gen !== generation) return;
       console.error("[voice] engine error:", message, cause);
@@ -294,6 +344,9 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
   c.setMuted(s.selfMuted);
   c.setDeafened(s.selfDeafened);
   c.setPushToTalk(getApp().pttActive);
+  setCameraPrefSender((userId, pref) => {
+    if (gen === generation && call === c) c.setCameraPreference(userId, pref);
+  });
 
   try {
     // Triggered from a click (or a reconnect after one), so audio autoplay is allowed.
@@ -310,7 +363,8 @@ async function startCall(channelId: string, rejoin: boolean): Promise<void> {
     setApp({ voiceStatus: "connecting" });
     return;
   }
-  h.send({ type: "voice.update", muted: s.selfMuted, deafened: s.selfDeafened });
+  // Camera is always off on join.
+  h.send({ type: "voice.update", muted: s.selfMuted, deafened: s.selfDeafened, video: false });
   setApp({ voiceStatus: "connected" });
   if (!rejoin) playSound("join");
   syncPeers();
@@ -432,6 +486,7 @@ useSettings.subscribe((s: Settings, prev: Settings) => {
       toast(`Couldn't switch output device: ${err instanceof Error ? err.message : String(err)}`, "error"),
     );
   }
+  if (s.videoDeviceId !== prev.videoDeviceId && c.isCameraOn()) void switchCameraDevice(c, s.videoDeviceId);
   if (s.inputMode !== prev.inputMode) c.setInputMode(s.inputMode);
   if (s.vadThreshold !== prev.vadThreshold) c.setVadThreshold(s.vadThreshold);
 });
@@ -440,8 +495,10 @@ useSettings.subscribe((s: Settings, prev: Settings) => {
 // Screen share ("Go Live")
 // ---------------------------------------------------------------------------
 
-function statsKey(s: StreamStats): string {
-  return s.direction === "send" ? `send:${s.viewerId ?? ""}` : `recv:${s.userId}`;
+/** Screen: `send:<viewer>` / `recv:<user>`; camera: the same prefixed with `cam:`. */
+export function statsKey(s: StreamStats): string {
+  const base = s.direction === "send" ? `send:${s.viewerId ?? ""}` : `recv:${s.userId}`;
+  return s.kind === "camera" ? `cam:${base}` : base;
 }
 
 let audioSupport: Promise<ScreenAudioSupport> | null = null;
@@ -680,4 +737,133 @@ export function openGoLive(): void {
     return;
   }
   setApp({ goLiveOpen: true });
+}
+
+// ---------------------------------------------------------------------------
+// Camera
+// ---------------------------------------------------------------------------
+
+function describeCameraError(err: unknown): string {
+  const name = err instanceof Error || err instanceof DOMException ? (err as Error).name : "";
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+    case "PermissionDeniedError":
+      return bridge.platform === "darwin"
+        ? "Camera access was denied. Allow Shpihcord in System Settings → Privacy & Security → Camera."
+        : "Camera access was denied. Allow camera access for Shpihcord and try again.";
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+      return "No camera was found. Plug one in or pick another camera in Settings → Voice & Video.";
+    case "OverconstrainedError":
+      return "The selected camera isn't available. Pick another camera in Settings → Voice & Video.";
+    case "NotReadableError":
+    case "TrackStartError":
+    case "AbortError":
+      return "Couldn't open the camera. It may be in use by another application.";
+    default:
+      return `Couldn't turn on the camera: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+function cameraDeviceArg(id: string): string | undefined {
+  return id && id !== "default" ? id : undefined;
+}
+
+function sendVideo(video: boolean): void {
+  const s = getSettings();
+  if (getApp().voiceChannelId) hub?.send({ type: "voice.update", muted: s.selfMuted, deafened: s.selfDeafened, video });
+}
+
+function clearCameraSendStats(): Partial<AppState> | null {
+  const st = getApp().streamStats;
+  const keys = Object.keys(st).filter((k) => k.startsWith("cam:send:"));
+  if (!keys.length) return null;
+  const streamStats = { ...st };
+  for (const k of keys) delete streamStats[k];
+  return { streamStats };
+}
+
+/** Turn our camera on. Resolves true when it's on. */
+export async function startCamera(): Promise<boolean> {
+  const c = call;
+  if (!c || !hub || getApp().voiceStatus !== "connected") {
+    toast("Join a voice channel to turn on your camera.", "error");
+    return false;
+  }
+  if (getApp().cameraStatus !== "off") return getApp().cameraStatus === "on";
+  const gen = generation;
+  const seq = ++cameraSeq;
+  const stale = () => gen !== generation || seq !== cameraSeq || call !== c;
+  setApp({ cameraStatus: "starting" });
+  try {
+    await c.startCamera(cameraDeviceArg(getSettings().videoDeviceId));
+  } catch (err) {
+    if (stale()) return false;
+    console.error("[camera] start failed", err);
+    try {
+      c.stopCamera();
+    } catch {
+      /* nothing to stop */
+    }
+    setApp({ cameraStatus: "off", localCamera: null });
+    toast(describeCameraError(err), "error", 8000);
+    playSound("error");
+    return false;
+  }
+  if (stale()) {
+    // Turned off / left while the device was opening.
+    if (call === c) c.stopCamera();
+    return false;
+  }
+  setApp({ cameraStatus: "on" });
+  sendVideo(true);
+  return true;
+}
+
+/** Turn our camera off and release the device. */
+export function stopCamera(reason?: "ended"): void {
+  cameraSeq++;
+  const was = getApp().cameraStatus;
+  if (was === "off") return;
+  try {
+    call?.stopCamera();
+  } catch (err) {
+    console.warn("[camera] stop failed", err);
+  }
+  setApp({ cameraStatus: "off", localCamera: null, ...clearCameraSendStats() });
+  // "starting" never told the hub video:true, but it's harmless and keeps it consistent.
+  sendVideo(false);
+  if (reason === "ended") toast("Your camera stopped (it was unplugged or access was revoked).", "info", 7000);
+}
+
+export function toggleCamera(): void {
+  if (getApp().cameraStatus === "off") void startCamera();
+  else stopCamera();
+}
+
+async function switchCameraDevice(c: VoiceCall, deviceId: string): Promise<void> {
+  let id = cameraDeviceArg(deviceId);
+  if (!id) {
+    // "Default" = the first camera the system lists.
+    try {
+      id = (await navigator.mediaDevices.enumerateDevices()).find((d) => d.kind === "videoinput" && d.deviceId)?.deviceId;
+    } catch {
+      id = undefined;
+    }
+    if (!id) return;
+  }
+  if (call !== c || !c.isCameraOn()) return;
+  try {
+    await c.setCameraDevice(id);
+  } catch (err) {
+    if (call !== c) return;
+    console.error("[camera] device switch failed", err);
+    toast(describeCameraError(err), "error", 8000);
+  }
+}
+
+/** Local "Hide video" for one user (persisted); the preference manager turns their camera off. */
+export function setVideoHidden(userId: string, hidden: boolean): void {
+  useSettings.getState().setVideoHidden(userId, hidden);
 }

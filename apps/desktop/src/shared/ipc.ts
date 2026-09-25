@@ -112,6 +112,14 @@ export interface ShpihcordApi {
      */
     select(req: ScreenSelectRequest): Promise<ScreenSelectResult>;
   };
+  window: {
+    /**
+     * The main window was minimized/hidden (false) or restored/shown (true).
+     * Needed because backgroundThrottling=false keeps document.visibilityState
+     * "visible" while minimized.
+     */
+    onVisibility(handler: (visible: boolean) => void): () => void;
+  };
 }
 
 export const IPC = {
@@ -127,4 +135,5 @@ export const IPC = {
   screenGetSources: "screen:getSources",
   screenAudioSupport: "screen:audioSupport",
   screenSelect: "screen:select",
+  windowVisibility: "window:visibility",
 } as const;

@@ -14,6 +14,9 @@ export interface Toast {
   message: string;
 }
 
+/** Our own camera: "starting" while the engine acquires the device. */
+export type CameraStatus = "off" | "starting" | "on";
+
 /** Our own screen share ("Go Live"). */
 export interface LocalShare {
   status: "starting" | "live";
@@ -66,8 +69,18 @@ export interface AppState {
   focusedStream: string | null;
   /** Remote screen streams we are receiving, by sharer. */
   remoteStreams: Record<string, MediaStream>;
-  /** Latest stats per stream: key `send:<viewerId>` or `recv:<userId>`. */
+  /**
+   * Latest stats per stream: screen `send:<viewerId>` / `recv:<userId>`,
+   * camera `cam:send:<viewerId>` / `cam:recv:<userId>` (see statsKey in voice.ts).
+   */
   streamStats: Record<string, StreamStats>;
+
+  /** Our camera (always off on join; never persisted). */
+  cameraStatus: CameraStatus;
+  /** Local camera preview stream (the track that is sent); render mirrored. */
+  localCamera: MediaStream | null;
+  /** Remote camera streams we are receiving, by user. */
+  remoteCameras: Record<string, MediaStream>;
 
   settingsOpen: boolean;
   toasts: Toast[];
@@ -99,6 +112,9 @@ const initial: AppState = {
   focusedStream: null,
   remoteStreams: {},
   streamStats: {},
+  cameraStatus: "off",
+  localCamera: null,
+  remoteCameras: {},
   settingsOpen: false,
   toasts: [],
 };

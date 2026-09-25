@@ -6,9 +6,10 @@ import { startMicTest } from "../lib/micTest";
 import { bindingFromKeyboardEvent, bindingFromMouseEvent, setPttRecording } from "../lib/ptt";
 import { logout } from "../lib/session";
 import { setApp, useApp } from "../store/app";
+import { StreamVideo } from "./Stream";
 import { useSettings, type Settings } from "../store/settings";
 import { Avatar } from "./Avatar";
-import { KeyboardIcon, LogOutIcon, MicIcon, ShieldIcon, XIcon } from "./Icons";
+import { KeyboardIcon, LogOutIcon, MicIcon, ShieldIcon, VideoOffIcon, XIcon } from "./Icons";
 
 type Tab = "voice" | "account";
 
@@ -36,7 +37,7 @@ export function SettingsModal() {
           </button>
           <div className="settings-nav-heading">App Settings</div>
           <button className={`settings-nav-item${tab === "voice" ? " selected" : ""}`} onClick={() => setTab("voice")}>
-            Voice &amp; Audio
+            Voice &amp; Video
           </button>
           <div className="settings-nav-sep" />
           <button className="settings-nav-item danger" onClick={() => void logout()}>
@@ -101,7 +102,7 @@ function AccountSettings() {
 
 // ---------------------------------------------------------------------------
 
-function useDevices(): { inputs: MediaDeviceInfo[]; outputs: MediaDeviceInfo[] } {
+function useDevices(): { inputs: MediaDeviceInfo[]; outputs: MediaDeviceInfo[]; cameras: MediaDeviceInfo[] } {
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   useEffect(() => {
     let alive = true;
@@ -125,6 +126,7 @@ function useDevices(): { inputs: MediaDeviceInfo[]; outputs: MediaDeviceInfo[] }
   return {
     inputs: devices.filter((d) => d.kind === "audioinput"),
     outputs: devices.filter((d) => d.kind === "audiooutput"),
+    cameras: devices.filter((d) => d.kind === "videoinput"),
   };
 }
 
@@ -187,12 +189,12 @@ function Toggle({
 function VoiceSettings() {
   const s = useSettings();
   const inCall = useApp((st) => !!st.voiceChannelId);
-  const { inputs, outputs } = useDevices();
+  const { inputs, outputs, cameras } = useDevices();
   const update = (patch: Partial<Settings>) => s.update(patch);
 
   return (
     <section>
-      <h2 className="settings-title">Voice &amp; Audio</h2>
+      <h2 className="settings-title">Voice &amp; Video</h2>
 
       <div className="settings-grid-2">
         <DeviceSelect
@@ -269,6 +271,32 @@ function VoiceSettings() {
         checked={s.autoGainControl}
         onChange={(v) => update({ autoGainControl: v })}
       />
+
+      <div className="settings-divider" />
+
+      <h3 className="settings-subtitle">Video Settings</h3>
+      <CameraPreview deviceId={s.videoDeviceId} />
+      <DeviceSelect
+        label="Camera"
+        devices={cameras}
+        value={s.videoDeviceId}
+        onChange={(id) => update({ videoDeviceId: id })}
+        fallbackName="Camera"
+      />
+      <Toggle
+        title="Don't receive video"
+        description="Pause everyone's camera to save bandwidth. You can also hide one person's video from their profile menu."
+        checked={s.disableIncomingVideo}
+        onChange={(v) => update({ disableIncomingVideo: v })}
+      />
+      {Object.keys(s.hiddenVideos).length > 0 && (
+        <p className="settings-hint">
+          Hidden cameras: {Object.keys(s.hiddenVideos).length}.{" "}
+          <button className="link" onClick={() => update({ hiddenVideos: {} })}>
+            Show all again
+          </button>
+        </p>
+      )}
 
       <div className="settings-divider" />
 
@@ -419,6 +447,79 @@ function KeybindRecorder({ binding, onChange }: { binding: PttBinding | null; on
             ? "Works everywhere, even while you're in a game."
             : "Push-to-talk works while Shpihcord is focused."}
       </p>
+    </div>
+  );
+}
+
+function cameraErrorText(err: unknown): string {
+  const name = err instanceof Error || err instanceof DOMException ? (err as Error).name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") return "Camera access was denied.";
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "No camera found.";
+  if (name === "NotReadableError" || name === "AbortError") return "The camera is in use by another app.";
+  return "Couldn't open the camera.";
+}
+
+/**
+ * Live, mirrored camera preview. Opens its own capture while the settings are
+ * open (stopped on close/device change); if the call's camera is on, shows
+ * that stream instead so the device isn't opened twice.
+ */
+function CameraPreview({ deviceId }: { deviceId: string }) {
+  const callCamera = useApp((s) => s.cameraStatus);
+  const callStream = useApp((s) => s.localCamera);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const useCall = callCamera !== "off";
+
+  useEffect(() => {
+    if (useCall) return;
+    let alive = true;
+    let own: MediaStream | null = null;
+    setError(null);
+    navigator.mediaDevices
+      .getUserMedia({
+        video: {
+          deviceId: deviceId && deviceId !== "default" ? { exact: deviceId } : undefined,
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      })
+      .then((st) => {
+        if (!alive) {
+          st.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        own = st;
+        setStream(st);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(cameraErrorText(err));
+      });
+    return () => {
+      alive = false;
+      own?.getTracks().forEach((t) => t.stop());
+      setStream(null);
+    };
+  }, [deviceId, useCall]);
+
+  const shown = useCall ? callStream : stream;
+  return (
+    <div className="camera-preview">
+      {shown ? (
+        <StreamVideo stream={shown} className="camera-preview-video" />
+      ) : (
+        <div className="camera-preview-empty">
+          {error ? (
+            <>
+              <VideoOffIcon size={28} />
+              <span>{error}</span>
+            </>
+          ) : (
+            <span className="spinner" />
+          )}
+        </div>
+      )}
+      {useCall && shown && <span className="camera-preview-tag">In call</span>}
     </div>
   );
 }

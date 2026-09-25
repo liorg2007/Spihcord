@@ -33,6 +33,15 @@ const api: ShpihcordApi = {
     select: (req: ScreenSelectRequest) =>
       ipcRenderer.invoke(IPC.screenSelect, { sourceId: req.sourceId, audio: req.audio }),
   },
+  window: {
+    onVisibility: (handler: (visible: boolean) => void) => {
+      const listener = (_e: IpcRendererEvent, visible: unknown) => handler(visible !== false);
+      ipcRenderer.on(IPC.windowVisibility, listener);
+      return () => {
+        ipcRenderer.removeListener(IPC.windowVisibility, listener);
+      };
+    },
+  },
 };
 
 contextBridge.exposeInMainWorld("shpihcord", api);

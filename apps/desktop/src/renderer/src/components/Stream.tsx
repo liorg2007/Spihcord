@@ -44,7 +44,7 @@ function useFullscreen(ref: RefObject<HTMLElement>) {
   return { isFs, toggle };
 }
 
-function statLine(s: StreamStats | undefined): string {
+export function statLine(s: StreamStats | undefined): string {
   if (!s) return "Waiting for stats…";
   const parts: string[] = [];
   if (s.width && s.height) parts.push(`${s.width}×${s.height}`);

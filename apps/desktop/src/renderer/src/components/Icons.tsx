@@ -247,3 +247,18 @@ export const WarningIcon = (p: IconProps) => (
     <line x1="12" x2="12.01" y1="17" y2="17" />
   </Svg>
 );
+
+export const VideoIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m16 13 5.22 3.48a.5.5 0 0 0 .78-.42V7.87a.5.5 0 0 0-.75-.43L16 10.5" />
+    <rect x="2" y="6" width="14" height="12" rx="2" />
+  </Svg>
+);
+
+export const VideoOffIcon = (p: IconProps) => (
+  <Svg {...p}>
+    <path d="m16 13 5.22 3.48a.5.5 0 0 0 .78-.42V7.87a.5.5 0 0 0-.75-.43L16 10.5" />
+    <rect x="2" y="6" width="14" height="12" rx="2" />
+    <Slash />
+  </Svg>
+);

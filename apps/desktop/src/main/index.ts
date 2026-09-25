@@ -10,6 +10,7 @@ import {
   setPttStateListener,
   shutdownPtt,
 } from "./ptt";
+import { setupPermissions } from "./permissions";
 import { getAudioSupport, getSources, selectSource, setupDisplayMediaHandler } from "./screen";
 
 const BG = "#1e1f22";
@@ -93,6 +94,17 @@ function createWindow(): void {
   });
 
   mainWindow.once("ready-to-show", () => mainWindow?.show());
+  // backgroundThrottling=false keeps document.visibilityState "visible" while
+  // minimized, so tell the renderer (it pauses incoming camera video meanwhile).
+  const win = mainWindow;
+  const sendVisibility = () => {
+    if (win.isDestroyed()) return;
+    win.webContents.send(IPC.windowVisibility, win.isVisible() && !win.isMinimized());
+  };
+  win.on("minimize", sendVisibility);
+  win.on("restore", sendVisibility);
+  win.on("hide", sendVisibility);
+  win.on("show", sendVisibility);
   mainWindow.on("closed", () => {
     mainWindow = null;
   });
@@ -133,19 +145,6 @@ function createTray(): void {
   } catch (err) {
     console.warn("[tray] unavailable:", err);
   }
-}
-
-function setupPermissions(): void {
-  const ses = session.defaultSession;
-  // Microphone (and later camera) only; deny everything else. Screen capture
-  // ("Go Live") also asks for "media" and is gated by the display-media handler.
-  ses.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === "media");
-  });
-  ses.setPermissionCheckHandler((_wc, permission) => {
-    const p = permission as string;
-    return p === "media" || p === "speaker-selection";
-  });
 }
 
 /** Only accept IPC from our own window's main frame. */
@@ -193,7 +192,7 @@ function setupIpc(): void {
 function onReady(): void {
   if (process.platform === "win32") app.setAppUserModelId("app.shpihcord.desktop");
   Menu.setApplicationMenu(null);
-  setupPermissions();
+  setupPermissions(session.defaultSession);
   setupIpc();
   createWindow();
   createTray();

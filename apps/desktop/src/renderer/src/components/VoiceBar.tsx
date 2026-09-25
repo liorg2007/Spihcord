@@ -1,7 +1,7 @@
 import { useMemo } from "react";
-import { leaveVoice, openGoLive, stopScreenShare } from "../lib/voice";
+import { leaveVoice, openGoLive, stopScreenShare, toggleCamera } from "../lib/voice";
 import { useApp } from "../store/app";
-import { HangupIcon, ScreenShareIcon, ScreenShareOffIcon, SignalIcon } from "./Icons";
+import { HangupIcon, ScreenShareIcon, ScreenShareOffIcon, SignalIcon, VideoIcon, VideoOffIcon } from "./Icons";
 import { LiveBadge } from "./Stream";
 
 /** The "Voice Connected" panel above the user panel. */
@@ -12,6 +12,7 @@ export function VoiceBar() {
   const peers = useApp((s) => s.peers);
   const hub = useApp((s) => s.connection);
   const share = useApp((s) => s.localShare);
+  const camera = useApp((s) => s.cameraStatus);
 
   const { ping, tone } = useMemo(() => {
     const list = Object.values(peers);
@@ -58,6 +59,16 @@ export function VoiceBar() {
         </div>
       )}
       <div className="voice-bar-actions">
+        <button
+          className={`voice-bar-btn${camera !== "off" ? " cam-on" : ""}`}
+          onClick={toggleCamera}
+          disabled={connecting && camera === "off"}
+          title={camera === "off" ? "Turn On Camera" : "Turn Off Camera"}
+          aria-pressed={camera !== "off"}
+        >
+          {camera === "off" ? <VideoOffIcon size={18} /> : <VideoIcon size={18} />}
+          <span>{camera === "starting" ? "Starting…" : "Video"}</span>
+        </button>
         <button
           className={`voice-bar-btn${share ? " live" : ""}`}
           onClick={() => (share ? stopScreenShare() : openGoLive())}

@@ -35,4 +35,5 @@ mac:
   category: public.app-category.social-networking
   extendInfo:
     NSMicrophoneUsageDescription: Shpihcord needs the microphone for voice chat.
+    NSCameraUsageDescription: Shpihcord uses the camera when you turn on video in a voice channel.
     NSAudioCaptureUsageDescription: Shpihcord captures system audio when you share your screen.
