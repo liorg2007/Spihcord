@@ -1,3 +1,5 @@
+<p align="center"><img src="apps/desktop/build/icon.png" alt="Shpihcord icon" width="128"></p>
+
 # Shpihcord
 
 A small, self-hosted Discord-like app for a group of friends: text channels,
