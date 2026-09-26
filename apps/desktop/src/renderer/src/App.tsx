@@ -3,6 +3,7 @@ import { ChannelSidebar } from "./components/ChannelSidebar";
 import { FatalScreen } from "./components/FatalScreen";
 import { GoLiveModal } from "./components/GoLiveModal";
 import { IdentityDialog } from "./components/IdentityDialog";
+import { SafetyInfoDialog } from "./components/SafetyInfoDialog";
 import { LogoMark } from "./components/Icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { MainArea } from "./components/MainArea";
@@ -88,6 +89,7 @@ function AppShell() {
       {goLiveOpen && <GoLiveModal />}
       {settingsOpen && <SettingsModal />}
       <IdentityDialog />
+      <SafetyInfoDialog />
     </div>
   );
 }

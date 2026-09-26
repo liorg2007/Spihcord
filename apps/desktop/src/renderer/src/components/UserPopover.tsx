@@ -5,6 +5,7 @@ import { setPeerMuted, setPeerVolume, setVideoHidden } from "../lib/voice";
 import { displayNameOf, useApp } from "../store/app";
 import { useSettings } from "../store/settings";
 import { Avatar } from "./Avatar";
+import { openSafetyInfo } from "./SafetyInfoDialog";
 import { ShieldIcon, SpeakerIcon } from "./Icons";
 import { ensureSelfFingerprint, pinKey, safetyNumber, setVerified, useIdentity } from "../lib/identity";
 
@@ -158,6 +159,16 @@ export function UserPopover() {
             title={pin.verified ? undefined : "Only after comparing this number with them over another channel"}
           >
             {pin.verified ? "Clear verification" : "Mark as verified"}
+          </button>
+          <button
+            className="settings-hint"
+            style={{ display: "block", marginTop: 6, padding: 0, background: "none", border: 0, cursor: "pointer", textDecoration: "underline" }}
+            onClick={() => {
+              closeUserPopover();
+              openSafetyInfo();
+            }}
+          >
+            What is this?
           </button>
         </div>
       )}

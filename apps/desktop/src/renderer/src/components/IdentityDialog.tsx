@@ -36,7 +36,7 @@ export function IdentityDialog() {
             <WarningIcon size={20} /> {invalid ? "Unsafe connection" : "Security key changed"}
           </h2>
         </header>
-        <div style={{ padding: "4px 20px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ padding: "4px 20px 16px", display: "flex", flexDirection: "column", gap: 12, overflowY: "auto", minHeight: 0 }}>
           {invalid ? (
             <p style={{ margin: 0 }}>
               {name}'s connection offered an invalid security key ({m.received}). The connection may be intercepted,
@@ -55,6 +55,11 @@ export function IdentityDialog() {
               <div style={{ fontFamily: "monospace", fontSize: 18, letterSpacing: 1, marginTop: 4 }}>{sn ?? "…"}</div>
               <div className="settings-hint" style={{ marginTop: 6 }}>
                 A reinstall, a new device or a cleared app profile also changes the key.
+              </div>
+              <div className="settings-hint" style={{ marginTop: 6 }}>
+                Why this matters: calls are end-to-end encrypted with a security key tied to each install. A different
+                key means either {name} set up the app again, or someone is sitting in the middle of the connection. If
+                the numbers match, trust the new key; if they don't, or you can't check, disconnect.
               </div>
             </div>
           )}
